@@ -348,6 +348,31 @@ describe("buildOfficialChannelCatalog", () => {
           "sha512-3GD+mf3EjTSUTOAREjTHAyp/deXdpgqB+q+xE0b19Qtat4ADhUV1mHDwFkVCRqTCBY5ATFKtKcipoDejqFj/+w==",
       },
     });
+    expect(
+      summarizeCatalogEntry(
+        findCatalogEntry(entries, (entry) => entry.name === "@tencent-connect/openclaw-qqbot"),
+      ),
+    ).toMatchObject({
+      name: "@tencent-connect/openclaw-qqbot",
+      source: "external",
+      plugin: {
+        id: "openclaw-qqbot",
+        label: "QQ Bot",
+      },
+      contracts: {
+        tools: ["qqbot_platform_api", "qqbot_remind"],
+      },
+      channel: {
+        id: "qqbot",
+        docsPath: "/channels/qqbot",
+      },
+      install: {
+        npmSpec: "@tencent-connect/openclaw-qqbot@2.0.0",
+        defaultChoice: "npm",
+        expectedIntegrity:
+          "sha512-8/M8S+PSms7F3ojgcgCZY72nfA5Gzqujo8JhNI4bwNAXSLsvi5qh03RF4qtso+67MN+rM482Cn7G3ZPhqOP78A==",
+      },
+    });
     expect(entries.some((entry) => entry.openclaw?.channel?.id === "local-only")).toBe(false);
   });
 

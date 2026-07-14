@@ -217,7 +217,7 @@ describe("listBundledChannelCatalogEntries", () => {
       label: "Telegram",
     });
     seedGeneratedChannelCatalog(root, {
-      packageName: "@openclaw/qqbot",
+      packageName: "@tencent-connect/openclaw-qqbot",
       id: "qqbot",
       label: "QQ Bot",
       docsPath: "/channels/qqbot",
