@@ -16,6 +16,7 @@ import {
   formatUnknownChannelMessage,
   formatUnsupportedChannelActionMessage,
 } from "../../cli/error-format.js";
+import { normalizeExternalChannelSetupConfig } from "../channel-setup/config-compatibility.js";
 import type { OpenClawConfig } from "../../config/config.js";
 import { parseStrictNonNegativeInteger } from "../../infra/parse-finite-number.js";
 import { commitConfigWithPendingPluginInstalls } from "../../plugins/install-record-commit.js";
@@ -293,7 +294,7 @@ async function channelsAddCommandImpl(
       ? { beforePersistentEffect: params.beforePersistentEffect }
       : {}),
   });
-  nextConfig = applied.nextConfig;
+  nextConfig = normalizeExternalChannelSetupConfig({ cfg: applied.nextConfig, channel });
 
   await params?.beforePersistentEffect?.();
   const committed = await commitConfigWithPendingPluginInstalls({
