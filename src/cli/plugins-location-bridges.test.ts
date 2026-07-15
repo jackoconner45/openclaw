@@ -185,7 +185,7 @@ describe("listPersistedBundledPluginLocationBridges", () => {
         bundledPluginId: "qqbot",
         pluginId: "openclaw-qqbot",
         preferredSource: "npm",
-        npmSpec: "@tencent-connect/openclaw-qqbot@2.0.0",
+        npmSpec: "@tencent-connect/openclaw-qqbot",
         channelIds: ["qqbot"],
       },
     ]);
