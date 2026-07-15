@@ -64,10 +64,16 @@ function listQQBotConfigEntries(qqbot: Record<string, unknown>): Array<{
 function migrateDefaultAccount(qqbot: Record<string, unknown>, changes: string[]): void {
   const accounts = getRecord(qqbot.accounts);
   const configuredDefaultAccount =
-    typeof qqbot.defaultAccount === "string" ? qqbot.defaultAccount.trim().toLowerCase() : "";
+    typeof qqbot.defaultAccount === "string" ? qqbot.defaultAccount.trim() : "";
+  const normalizedDefaultAccount = configuredDefaultAccount.toLowerCase();
   const defaultAccount = getRecord(accounts?.default);
-  if (configuredDefaultAccount && configuredDefaultAccount !== "default") {
-    const selectedAccount = getRecord(accounts?.[configuredDefaultAccount]);
+  if (configuredDefaultAccount && normalizedDefaultAccount !== "default") {
+    // Prefer the exact account key, but retain the bundled plugin's lowercase
+    // selector behavior for existing configs that depended on it.
+    const selectedAccountId = getRecord(accounts?.[configuredDefaultAccount])
+      ? configuredDefaultAccount
+      : normalizedDefaultAccount;
+    const selectedAccount = getRecord(accounts?.[selectedAccountId]);
     if (!selectedAccount) {
       delete qqbot.defaultAccount;
       changes.push(
@@ -81,17 +87,23 @@ function migrateDefaultAccount(qqbot: Record<string, unknown>, changes: string[]
       return;
     }
     const reorderedAccounts: Record<string, unknown> = {
-      [configuredDefaultAccount]: selectedAccount,
+      [selectedAccountId]: selectedAccount,
     };
     for (const [accountId, account] of Object.entries(accounts ?? {})) {
-      if (accountId !== configuredDefaultAccount && !isBlockedObjectKey(accountId)) {
+      if (accountId !== selectedAccountId && !isBlockedObjectKey(accountId)) {
         reorderedAccounts[accountId] = account;
       }
+    }
+    // Integer-index keys enumerate before ordinary keys regardless of insertion
+    // order. Keep defaultAccount so host validation fails closed instead of
+    // silently switching Tencent 2.0 to a different account.
+    if (Object.keys(reorderedAccounts)[0] !== selectedAccountId) {
+      return;
     }
     qqbot.accounts = reorderedAccounts;
     delete qqbot.defaultAccount;
     changes.push(
-      `Moved channels.qqbot.accounts.${configuredDefaultAccount} to the first account position and removed defaultAccount so Tencent QQBot 2.0 preserves the selected named default.`,
+      `Moved channels.qqbot.accounts.${selectedAccountId} to the first account position and removed defaultAccount so Tencent QQBot 2.0 preserves the selected named default.`,
     );
     return;
   }

@@ -330,10 +330,10 @@ describe("Tencent QQBot 2.0 config migrations", () => {
     const result = migrate({
       channels: {
         qqbot: {
-          defaultAccount: "ops",
+          defaultAccount: "Ops",
           accounts: {
             secondary: { appId: "secondary-app", allowFrom: ["SECONDARY"] },
-            ops: { appId: "ops-app", allowFrom: ["ops-user"] },
+            Ops: { appId: "ops-app", allowFrom: ["ops-user"] },
           },
         },
       },
@@ -341,9 +341,27 @@ describe("Tencent QQBot 2.0 config migrations", () => {
     const qqbot = (result.config.channels as { qqbot: Record<string, unknown> }).qqbot;
     const accounts = qqbot.accounts as Record<string, unknown>;
 
-    expect(Object.keys(accounts)).toEqual(["ops", "secondary"]);
+    expect(Object.keys(accounts)).toEqual(["Ops", "secondary"]);
     expect(qqbot).not.toHaveProperty("defaultAccount");
-    expect(accounts.ops).toMatchObject({ appId: "ops-app", allowFrom: ["OPS-USER"] });
+    expect(accounts.Ops).toMatchObject({ appId: "ops-app", allowFrom: ["OPS-USER"] });
+  });
+
+  it("fails closed when integer account keys prevent preserving a named default", () => {
+    const result = migrate({
+      channels: {
+        qqbot: {
+          defaultAccount: "ops",
+          accounts: {
+            "123": { appId: "numeric-app", allowFrom: ["NUMERIC"] },
+            ops: { appId: "ops-app", allowFrom: ["OPS"] },
+          },
+        },
+      },
+    });
+    const qqbot = (result.config.channels as { qqbot: Record<string, unknown> }).qqbot;
+
+    expect(qqbot.defaultAccount).toBe("ops");
+    expect(Object.keys(qqbot.accounts as Record<string, unknown>)).toEqual(["123", "ops"]);
   });
 
   it("locks native approvals when Tencent cannot represent the previous policy", () => {
