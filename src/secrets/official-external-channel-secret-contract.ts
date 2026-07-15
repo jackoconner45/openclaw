@@ -20,7 +20,7 @@ import {
 import { isRecord } from "./shared.js";
 import type { SecretTargetRegistryEntry } from "./target-registry-types.js";
 
-export type OfficialExternalChannelSecretContractApi = {
+type OfficialExternalChannelSecretContractApi = {
   collectRuntimeConfigAssignments: (params: {
     config: OpenClawConfig;
     defaults: SecretDefaults | undefined;
@@ -143,10 +143,7 @@ export function listOfficialExternalChannelSecretTargetRegistryEntries(): Secret
       getOfficialExternalPluginCatalogManifest(entry)?.channel?.id,
     );
     return channelId
-      ? [
-          ...(loadOfficialExternalChannelSecretContractApi(channelId)
-            ?.secretTargetRegistryEntries ?? []),
-        ]
+      ? (loadOfficialExternalChannelSecretContractApi(channelId)?.secretTargetRegistryEntries ?? [])
       : [];
   });
 }

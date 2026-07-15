@@ -72,13 +72,13 @@ export type OfficialExternalWebSearchProvider = {
   autoDetectOrder?: number;
 };
 
-export type OfficialExternalChannelSecretField = {
+type OfficialExternalChannelSecretField = {
   field: string;
   activationField?: string;
   activationEnv?: string;
 };
 
-export type OfficialExternalChannelSecretContract = {
+type OfficialExternalChannelSecretContract = {
   channelId: string;
   fields: readonly OfficialExternalChannelSecretField[];
 };
