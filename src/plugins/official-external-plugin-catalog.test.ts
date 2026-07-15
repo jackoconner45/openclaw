@@ -7,6 +7,7 @@ import officialExternalPluginCatalog from "../../scripts/lib/official-external-p
 import { closeOpenClawStateDatabaseForTest } from "../state/openclaw-state-db.js";
 import { createSqliteHostedOfficialExternalPluginCatalogSnapshotStore } from "./official-external-plugin-catalog-snapshot-store.js";
 import {
+  getOfficialExternalChannelSecretContract,
   type HostedOfficialExternalPluginCatalogSnapshot,
   type HostedOfficialExternalPluginCatalogSnapshotStore,
   type OfficialExternalPluginCatalogEntry,
@@ -1920,6 +1921,16 @@ describe("official external plugin catalog", () => {
       defaultChoice: "npm",
       expectedIntegrity:
         "sha512-8/M8S+PSms7F3ojgcgCZY72nfA5Gzqujo8JhNI4bwNAXSLsvi5qh03RF4qtso+67MN+rM482Cn7G3ZPhqOP78A==",
+    });
+    expect(getOfficialExternalChannelSecretContract("qqbot")).toEqual({
+      channelId: "qqbot",
+      fields: [
+        {
+          field: "clientSecret",
+          activationField: "appId",
+          activationEnv: "QQBOT_APP_ID",
+        },
+      ],
     });
   });
 
