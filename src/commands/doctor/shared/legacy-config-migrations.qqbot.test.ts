@@ -333,7 +333,7 @@ describe("Tencent QQBot 2.0 config migrations", () => {
           defaultAccount: "Ops",
           accounts: {
             secondary: { appId: "secondary-app", allowFrom: ["SECONDARY"] },
-            Ops: { appId: "ops-app", allowFrom: ["ops-user"] },
+            ops: { appId: "ops-app", allowFrom: ["ops-user"] },
           },
         },
       },
@@ -341,9 +341,28 @@ describe("Tencent QQBot 2.0 config migrations", () => {
     const qqbot = (result.config.channels as { qqbot: Record<string, unknown> }).qqbot;
     const accounts = qqbot.accounts as Record<string, unknown>;
 
-    expect(Object.keys(accounts)).toEqual(["Ops", "secondary"]);
+    expect(Object.keys(accounts)).toEqual(["ops", "secondary"]);
     expect(qqbot).not.toHaveProperty("defaultAccount");
-    expect(accounts.Ops).toMatchObject({ appId: "ops-app", allowFrom: ["OPS-USER"] });
+    expect(accounts.ops).toMatchObject({ appId: "ops-app", allowFrom: ["OPS-USER"] });
+  });
+
+  it("preserves the bundled plugin's lowercase selection for case-colliding accounts", () => {
+    const result = migrate({
+      channels: {
+        qqbot: {
+          defaultAccount: "Ops",
+          accounts: {
+            Ops: { appId: "uppercase-app", allowFrom: ["UPPER"] },
+            ops: { appId: "lowercase-app", allowFrom: ["LOWER"] },
+          },
+        },
+      },
+    });
+    const qqbot = (result.config.channels as { qqbot: Record<string, unknown> }).qqbot;
+    const accounts = qqbot.accounts as Record<string, { appId?: string }>;
+
+    expect(Object.keys(accounts)).toEqual(["ops", "Ops"]);
+    expect(accounts.ops?.appId).toBe("lowercase-app");
   });
 
   it("fails closed when integer account keys prevent preserving a named default", () => {

@@ -68,11 +68,9 @@ function migrateDefaultAccount(qqbot: Record<string, unknown>, changes: string[]
   const normalizedDefaultAccount = configuredDefaultAccount.toLowerCase();
   const defaultAccount = getRecord(accounts?.default);
   if (configuredDefaultAccount && normalizedDefaultAccount !== "default") {
-    // Prefer the exact account key, but retain the bundled plugin's lowercase
-    // selector behavior for existing configs that depended on it.
-    const selectedAccountId = getRecord(accounts?.[configuredDefaultAccount])
-      ? configuredDefaultAccount
-      : normalizedDefaultAccount;
+    // The bundled plugin lowercased defaultAccount before lookup. Preserve that
+    // exact selection rule so case-colliding account credentials cannot switch.
+    const selectedAccountId = normalizedDefaultAccount;
     const selectedAccount = getRecord(accounts?.[selectedAccountId]);
     if (!selectedAccount) {
       delete qqbot.defaultAccount;
