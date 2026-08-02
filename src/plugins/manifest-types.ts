@@ -423,6 +423,8 @@ export type PluginManifest = {
 };
 
 export type PluginManifestContracts = {
+  /** Privileged host capabilities granted only to bundled plugin runtimes. */
+  privilegedRuntimeCapabilities?: string[];
   embeddedExtensionFactories?: string[];
   agentToolResultMiddleware?: string[];
   trustedToolPolicies?: string[];

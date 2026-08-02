@@ -28,6 +28,7 @@ import {
   isAgentHarnessSessionKey,
   isAgentHarnessSessionKeyOwnedBy,
 } from "../sessions/agent-harness-session-key.js";
+import { registerPluginRuntimeAuthorization } from "./plugin-runtime-authorization.js";
 import type { PluginRegistryState } from "./registry-state.js";
 import type { PluginRecord } from "./registry-types.js";
 import {
@@ -877,6 +878,14 @@ export function createPluginRuntimeResolver(state: PluginRegistryState) {
         } satisfies PluginRuntime["subagent"];
       },
     });
+    const record =
+      pluginRuntimeRecordById.get(pluginId) ??
+      registry.plugins.find((entry) => entry.id === pluginId);
+    if (record) {
+      // Bind authorization to this exact host-created proxy. A plugin-supplied id or
+      // structurally similar object must never inherit loader provenance.
+      registerPluginRuntimeAuthorization(runtime, record);
+    }
     pluginRuntimeById.set(pluginId, runtime);
     return runtime;
   };

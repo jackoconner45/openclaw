@@ -406,6 +406,7 @@ function mergeManifestContracts(
   }
   const contracts: PluginManifestContracts = {};
   for (const key of [
+    "privilegedRuntimeCapabilities",
     "embeddedExtensionFactories",
     "agentToolResultMiddleware",
     "trustedToolPolicies",

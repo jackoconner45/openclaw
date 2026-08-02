@@ -2520,6 +2520,7 @@ describe("loadPluginManifestRegistry", () => {
       id: "workflow-harness",
       contracts: {
         agentToolResultMiddleware: ["openclaw", "codex"],
+        privilegedRuntimeCapabilities: [" discord.provider-endpoint ", ""],
         trustedToolPolicies: ["workflow-budget"],
       },
       configSchema: { type: "object" },
@@ -2533,6 +2534,7 @@ describe("loadPluginManifestRegistry", () => {
 
     expect(registry.plugins[0]?.contracts).toEqual({
       agentToolResultMiddleware: ["openclaw", "codex"],
+      privilegedRuntimeCapabilities: ["discord.provider-endpoint"],
       trustedToolPolicies: ["workflow-budget"],
     });
   });

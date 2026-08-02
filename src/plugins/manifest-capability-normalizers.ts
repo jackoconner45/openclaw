@@ -341,6 +341,7 @@ export function normalizeManifestCatalog(value: unknown): PluginManifestCatalog 
 }
 
 const MANIFEST_CONTRACT_KEYS = [
+  "privilegedRuntimeCapabilities",
   "embeddedExtensionFactories",
   "agentToolResultMiddleware",
   "trustedToolPolicies",

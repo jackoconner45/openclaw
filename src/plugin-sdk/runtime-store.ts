@@ -1,5 +1,7 @@
 // Runtime store exports expose plugin runtime type contracts without loading runtime code.
 export type { PluginRuntime } from "../plugins/runtime/types.js";
+import { assertBundledPluginRuntimeCapability as assertBundledPluginRuntimeCapabilityInternal } from "../plugins/plugin-runtime-authorization.js";
+import type { PluginRuntime } from "../plugins/runtime/types.js";
 import { getNamedPluginRuntimeStoreSlot } from "./runtime-store-registry.js";
 type PluginRuntimeStoreKeyOptions = {
   /** Explicit global registry key for shared runtime slots. */
@@ -14,6 +16,14 @@ type PluginRuntimeStorePluginOptions = {
   errorMessage: string;
 };
 type PluginRuntimeStoreOptions = PluginRuntimeStoreKeyOptions | PluginRuntimeStorePluginOptions;
+
+/** Require an authentic bundled runtime with a manifest-declared privileged capability. */
+export function assertBundledPluginRuntimeCapability(
+  runtime: PluginRuntime,
+  capability: string,
+): void {
+  assertBundledPluginRuntimeCapabilityInternal(runtime, capability);
+}
 
 function pluginRuntimeStoreKeyForPluginId(pluginId: string): string {
   const normalizedPluginId = pluginId.trim();

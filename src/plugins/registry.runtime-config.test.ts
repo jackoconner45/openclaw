@@ -7,6 +7,7 @@ import type { SessionEntry } from "../config/sessions/types.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { resolveUserPath } from "../utils.js";
 import { createPluginRecord } from "./loader-records.js";
+import { assertBundledPluginRuntimeCapability } from "./plugin-runtime-authorization.js";
 import { createPluginRegistry } from "./registry.js";
 import { getPluginRuntimeGatewayRequestScope } from "./runtime/gateway-request-scope.js";
 import { createPluginRuntime } from "./runtime/index.js";
@@ -26,6 +27,85 @@ function createTestRegistry(runtime: PluginRuntime) {
 }
 
 describe("plugin registry runtime config scope", () => {
+  it("authorizes only exact host-issued bundled runtimes with the declared capability", () => {
+    const pluginRegistry = createTestRegistry(createPluginRuntime());
+    const config = {} as OpenClawConfig;
+    const createApi = (params: {
+      id: string;
+      origin: "bundled" | "global";
+      trustedOfficialInstall?: boolean;
+      privilegedRuntimeCapabilities?: string[];
+    }) =>
+      pluginRegistry.createApi(
+        createPluginRecord({
+          ...params,
+          name: params.id,
+          source: `/plugins/${params.id}/index.js`,
+          enabled: true,
+          configSchema: false,
+          contracts: params.privilegedRuntimeCapabilities
+            ? { privilegedRuntimeCapabilities: params.privilegedRuntimeCapabilities }
+            : undefined,
+        }),
+        { config },
+      );
+
+    const capability = "discord.provider-endpoint";
+    const bundled = createApi({
+      id: "bundled-bootstrap",
+      origin: "bundled",
+      privilegedRuntimeCapabilities: [capability],
+    });
+    const unrelatedBundled = createApi({ id: "unrelated-bundled", origin: "bundled" });
+    const differentlyEntitledBundled = createApi({
+      id: "different-bundled",
+      origin: "bundled",
+      privilegedRuntimeCapabilities: ["other.capability"],
+    });
+    const official = createApi({
+      id: "official-plugin",
+      origin: "global",
+      trustedOfficialInstall: true,
+      privilegedRuntimeCapabilities: [capability],
+    });
+    const untrusted = createApi({
+      id: "workspace-plugin",
+      origin: "global",
+      privilegedRuntimeCapabilities: [capability],
+    });
+    const lateGrantRecord = createPluginRecord({
+      id: "late-grant-bundled",
+      name: "late-grant-bundled",
+      source: "/plugins/late-grant-bundled/index.js",
+      origin: "bundled",
+      enabled: true,
+      configSchema: false,
+    });
+    const lateGrant = pluginRegistry.createApi(lateGrantRecord, { config });
+    // Authorization is immutable after runtime issuance; later metadata mutation cannot grant it.
+    lateGrantRecord.contracts = { privilegedRuntimeCapabilities: [capability] };
+
+    expect(() => assertBundledPluginRuntimeCapability(bundled.runtime, capability)).not.toThrow();
+    expect(() =>
+      assertBundledPluginRuntimeCapability(unrelatedBundled.runtime, capability),
+    ).toThrow(/not granted privileged runtime capability "discord.provider-endpoint"/);
+    expect(() =>
+      assertBundledPluginRuntimeCapability(differentlyEntitledBundled.runtime, capability),
+    ).toThrow(/not granted privileged runtime capability "discord.provider-endpoint"/);
+    expect(() => assertBundledPluginRuntimeCapability(official.runtime, capability)).toThrow(
+      /plugin "official-plugin" loaded with origin "global"/,
+    );
+    expect(() => assertBundledPluginRuntimeCapability(untrusted.runtime, capability)).toThrow(
+      /plugin "workspace-plugin" loaded with origin "global"/,
+    );
+    expect(() => assertBundledPluginRuntimeCapability(lateGrant.runtime, capability)).toThrow(
+      /not granted privileged runtime capability "discord.provider-endpoint"/,
+    );
+    expect(() => assertBundledPluginRuntimeCapability({} as PluginRuntime, capability)).toThrow(
+      /runtime was not issued by OpenClaw/,
+    );
+  });
+
   it("resolves plugin API paths against the plugin root", () => {
     const pluginRoot = path.join(os.tmpdir(), "openclaw-plugins", "demo");
     const pluginRegistry = createTestRegistry(createPluginRuntime());
