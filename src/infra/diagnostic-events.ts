@@ -284,6 +284,7 @@ type DiagnosticSessionAttentionBaseEvent = DiagnosticBaseEvent & {
   activeToolName?: string;
   activeToolCallId?: string;
   activeToolAgeMs?: number;
+  repeatedRequestNoProgressAgeMs?: number;
   terminalProgressStale?: boolean;
 };
 
@@ -371,6 +372,8 @@ export type DiagnosticRunProgressEvent = DiagnosticBaseEvent & {
   sessionId?: string;
   runId?: string;
   reason: string;
+  /** Semantic progress resets no-forward-progress evidence; liveness only keeps work alive. */
+  progressKind?: "semantic" | "liveness";
 };
 
 /**
