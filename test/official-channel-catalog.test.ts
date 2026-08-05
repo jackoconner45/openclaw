@@ -367,8 +367,10 @@ describe("buildOfficialChannelCatalog", () => {
         docsPath: "/channels/qqbot",
       },
       install: {
-        npmSpec: "@tencent-connect/openclaw-qqbot",
+        npmSpec: "@tencent-connect/openclaw-qqbot@2.0.0",
         defaultChoice: "npm",
+        expectedIntegrity:
+          "sha512-8/M8S+PSms7F3ojgcgCZY72nfA5Gzqujo8JhNI4bwNAXSLsvi5qh03RF4qtso+67MN+rM482Cn7G3ZPhqOP78A==",
       },
     });
     expect(entries.some((entry) => entry.openclaw?.channel?.id === "local-only")).toBe(false);
@@ -700,11 +702,6 @@ describe("buildOfficialChannelCatalog", () => {
     expect(entries.length).toBeGreaterThan(0);
     for (const entry of entries) {
       const installSource = describePluginInstallSource(requireInstall(entry));
-      if (entry.name === "@tencent-connect/openclaw-qqbot") {
-        expect(requireNpmInstallSource(installSource).pinState).toBe("floating-without-integrity");
-        expect(installSource.warnings).toEqual(["npm-spec-floating", "npm-spec-missing-integrity"]);
-        continue;
-      }
       expect(installSource.warnings).toStrictEqual([]);
       expect(requireNpmInstallSource(installSource).pinState).toBe("exact-with-integrity");
     }

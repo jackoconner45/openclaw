@@ -1917,8 +1917,10 @@ describe("official external plugin catalog", () => {
     expect(resolveOfficialExternalPluginId(qqbotByChannel)).toBe("openclaw-qqbot");
     expect(qqbotByPlugin).toBe(qqbotByChannel);
     expect(resolveOfficialExternalPluginInstall(qqbotByChannel)).toEqual({
-      npmSpec: "@tencent-connect/openclaw-qqbot",
+      npmSpec: "@tencent-connect/openclaw-qqbot@2.0.0",
       defaultChoice: "npm",
+      expectedIntegrity:
+        "sha512-8/M8S+PSms7F3ojgcgCZY72nfA5Gzqujo8JhNI4bwNAXSLsvi5qh03RF4qtso+67MN+rM482Cn7G3ZPhqOP78A==",
     });
     expect(getOfficialExternalChannelSecretContract("qqbot")).toEqual({
       channelId: "qqbot",
