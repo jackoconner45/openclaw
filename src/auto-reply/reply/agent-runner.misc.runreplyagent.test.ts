@@ -120,6 +120,10 @@ vi.mock("../../agents/embedded-agent.js", () => {
   };
 });
 
+vi.mock("../../agents/embedded-agent-runner/run-orchestrator.js", () => ({
+  runEmbeddedAgentInternal: (params: unknown) => runEmbeddedAgentMock(params),
+}));
+
 vi.mock("../../agents/cli-runner.js", () => ({
   runCliAgent: (...args: unknown[]) => runCliAgentMock(...args),
 }));
