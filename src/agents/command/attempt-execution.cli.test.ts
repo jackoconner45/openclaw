@@ -33,6 +33,7 @@ import {
   saveAuthProfileStore,
 } from "../auth-profiles/store.js";
 import { testing as cliBackendsTesting } from "../cli-backends.test-support.js";
+import { createCodeModeActivityOwner } from "../code-mode-activity.js";
 import { resolveEmbeddedRunAccountingObservers } from "../embedded-agent-runner/run/accounting-observers.js";
 import type { EmbeddedAgentRunResult } from "../embedded-agent.js";
 import { FailoverError } from "../failover-error.js";
@@ -546,6 +547,8 @@ describe("CLI attempt execution", () => {
     timeoutMs?: number;
     runTimeoutOverrideMs?: number;
     commandRunAccounting?: RunAgentAttemptParams["commandRunAccounting"];
+    embeddedResult?: EmbeddedAgentRunResult;
+    onResult?: (result: EmbeddedAgentRunResult) => void;
   }) {
     const runId = overrides?.runId ?? "run-embedded-live-stream-gate";
     const sessionKey = overrides?.sessionKey ?? `agent:main:direct:${runId}`;
@@ -571,12 +574,15 @@ describe("CLI attempt execution", () => {
       } as SessionEntry;
     }
     await writeSessionStoreSeed(sessionStore);
-    runEmbeddedAgentMock.mockResolvedValueOnce({
-      meta: { durationMs: 1 },
-    } satisfies EmbeddedAgentRunResult);
+    runEmbeddedAgentMock.mockResolvedValueOnce(
+      overrides?.embeddedResult ??
+        ({
+          meta: { durationMs: 1 },
+        } satisfies EmbeddedAgentRunResult),
+    );
     const providerOverride = overrides?.providerOverride ?? "openai";
 
-    await runAgentAttempt({
+    const result = await runAgentAttempt({
       commandRunAccounting: overrides?.commandRunAccounting,
       providerOverride,
       originalProvider: "openai",
@@ -614,6 +620,7 @@ describe("CLI attempt execution", () => {
       sessionHasHistory: false,
       userTurnTranscriptRecorder: overrides?.userTurnTranscriptRecorder,
     });
+    overrides?.onResult?.(result);
 
     return firstEmbeddedAgentArg(runEmbeddedAgentMock.mock.calls.length - 1);
   }
@@ -775,7 +782,13 @@ describe("CLI attempt execution", () => {
   });
 
   it("forwards command accounting only to the embedded runner boundary", async () => {
+    const codeModeActivityOwner = createCodeModeActivityOwner();
+    const sourceResult = {
+      meta: { durationMs: 1 },
+    } satisfies EmbeddedAgentRunResult;
+    let returnedResult: EmbeddedAgentRunResult | undefined;
     const commandRunAccounting = {
+      codeModeActivityOwner,
       selectRuntime: vi.fn(),
       beginAgentSubmission: vi.fn(),
       observeEmbeddedAttempt: vi.fn(),
@@ -786,14 +799,21 @@ describe("CLI attempt execution", () => {
     const embedded = await runOpenClawEmbeddedAttemptForTest({
       runId: "embedded-command-accounting",
       commandRunAccounting,
+      embeddedResult: sourceResult,
+      onResult: (result) => {
+        returnedResult = result;
+      },
     });
 
+    expect(returnedResult).toBe(sourceResult);
     expect(resolveEmbeddedRunAccountingObservers(embedded)).toEqual({
+      codeModeActivityOwner,
       onAgentSubmission: commandRunAccounting.beginAgentSubmission,
       onAttemptObserved: commandRunAccounting.observeEmbeddedAttempt,
       onRuntimeSelected: commandRunAccounting.selectRuntime,
       onOpaqueWork: commandRunAccounting.markOpaqueWork,
     });
+    expect(resolveEmbeddedRunAccountingObservers(returnedResult ?? {})).toBeUndefined();
   });
 
   async function runClaudeCliAttempt(params: {
@@ -908,6 +928,7 @@ describe("CLI attempt execution", () => {
       body: "account",
       runId: "run-cli-accounting",
       commandRunAccounting: {
+        codeModeActivityOwner: createCodeModeActivityOwner(),
         selectRuntime,
         beginAgentSubmission,
         observeEmbeddedAttempt: vi.fn(),

@@ -3,6 +3,7 @@
  */
 import type { DiagnosticTraceContext } from "../../../infra/diagnostic-trace-context.js";
 import { resolveToolLoopDetectionConfig } from "../../agent-tools.js";
+import { registerCodeModeRunActivity } from "../../code-mode-activity.js";
 import {
   CODE_MODE_EXEC_TOOL_NAME,
   CODE_MODE_WAIT_TOOL_NAME,
@@ -21,6 +22,7 @@ import {
 } from "../../tool-search.js";
 import { applyAgentToolSurfaceCatalog } from "../../tool-surface-plan.js";
 import { log } from "../logger.js";
+import { resolveEmbeddedRunAccountingObservers } from "./accounting-observers.js";
 import type { prepareEmbeddedAttemptBundleTools } from "./attempt-bundle-tools.js";
 import { collectAttemptExplicitToolAllowlistSources } from "./attempt-tool-allowlist.js";
 import type { prepareEmbeddedAttemptToolBase } from "./attempt-tool-base-prepare.js";
@@ -59,6 +61,14 @@ export function prepareEmbeddedAttemptToolCatalog(input: {
   } = preparedToolBase;
   const { clientTools, uncompactedEffectiveTools } = input.bundleTools;
   let effectiveTools = uncompactedEffectiveTools;
+  const accountingObservers = resolveEmbeddedRunAccountingObservers(attempt);
+  const codeModeActivityOwner =
+    codeModeControlsEnabledForRun && accountingObservers?.codeModeActivityOwner
+      ? accountingObservers.codeModeActivityOwner
+      : undefined;
+  if (codeModeActivityOwner) {
+    registerCodeModeRunActivity(codeModeActivityOwner);
+  }
   const catalogToolHookContext = {
     agentId: input.sessionAgentId,
     config: attempt.config,
@@ -84,6 +94,7 @@ export function prepareEmbeddedAttemptToolCatalog(input: {
         sessionKey: input.sandboxSessionKey,
         sessionId: attempt.sessionId,
         runId: attempt.runId,
+        codeModeActivityOwner,
         catalogRef: preparedToolBase.toolSearchCatalogRef,
         abortSignal: input.abortSignal,
         forceRestartSafeTools: attempt.forceRestartSafeTools,

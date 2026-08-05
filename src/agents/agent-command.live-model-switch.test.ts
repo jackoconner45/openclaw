@@ -4,6 +4,7 @@ import { expectDefined } from "@openclaw/normalization-core";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { SessionEntry } from "../config/sessions.js";
 import { createUserTurnTranscriptRecorder } from "../sessions/user-turn-transcript.js";
+import { createDeferred } from "../shared/deferred.js";
 import {
   deliveryContextFromSession,
   normalizeSessionDeliveryState,
@@ -25,7 +26,19 @@ import {
   resolveTestModelAliasFromPair,
   resolveTestModelRefFromString,
 } from "./agent-command.live-model-switch.test-helpers.js";
+import {
+  beginCodeModeControlActivity,
+  beginCodeModeSnapshotActivity,
+  registerCodeModeRunActivity,
+  sampleCodeModeRunFinalQuiescence,
+  type CodeModeActivityOwner,
+} from "./code-mode-activity.js";
+import { activeRuns, disposeCodeModeRun, resumingRunIds } from "./code-mode-state.js";
 import { resolveAgentCommandRunAccounting } from "./command/run-accounting.js";
+import {
+  bindEmbeddedRunAccountingObservers,
+  resolveEmbeddedRunAccountingObservers,
+} from "./embedded-agent-runner/run/accounting-observers.js";
 import {
   INTERNAL_RUNTIME_CONTEXT_BEGIN,
   INTERNAL_RUNTIME_CONTEXT_END,
@@ -231,7 +244,7 @@ vi.mock("./command/session.js", () => ({
       skillsSnapshot: { prompt: "", skills: [], version: 0 },
     };
     return {
-      sessionId: "session-1",
+      sessionId: sessionEntry.sessionId,
       sessionKey: state.resolvedSessionKeyMock ?? "agent:main:main",
       sessionEntry,
       sessionStore: state.sessionStoreMock,
@@ -1468,6 +1481,210 @@ describe("agentCommand – LiveSessionModelSwitchError retry", () => {
       state.deliverAgentCommandResultMock.mock.invocationCallOrder.at(-1) ?? 0,
     );
     vi.useRealTimers();
+  });
+
+  it("samples Code Mode quiescence before disposing command-owned parked runs", async () => {
+    const runId = "run-code-mode-final-quiescence";
+    const parkedRunId = "command-owned-parked-code-mode-run";
+    let activityOwner: CodeModeActivityOwner | undefined;
+    let releaseControl: (() => void) | undefined;
+    setupSingleAttemptFallback();
+    state.runAgentAttemptMock.mockImplementation(async (attemptParams: unknown) => {
+      const attempt = attemptParams as {
+        runId: string;
+        providerOverride: string;
+        modelOverride: string;
+        commandRunAccounting: {
+          readonly codeModeActivityOwner: CodeModeActivityOwner;
+          selectRuntime: (runtime: "embedded") => void;
+          observeEmbeddedAttempt: (observation: {
+            provider: string;
+            model: string;
+            assistantTurnsObserved: boolean;
+            toolsObserved: boolean;
+            codeModeEngaged: boolean;
+            codeModeLifecycleObserved: boolean;
+          }) => void;
+        };
+      };
+      attempt.commandRunAccounting.selectRuntime("embedded");
+      attempt.commandRunAccounting.observeEmbeddedAttempt({
+        provider: attempt.providerOverride,
+        model: attempt.modelOverride,
+        assistantTurnsObserved: true,
+        toolsObserved: true,
+        codeModeEngaged: true,
+        codeModeLifecycleObserved: true,
+      });
+      activityOwner = attempt.commandRunAccounting.codeModeActivityOwner;
+      registerCodeModeRunActivity(activityOwner);
+      releaseControl = beginCodeModeControlActivity(activityOwner);
+      activeRuns.set(parkedRunId, {
+        runId: parkedRunId,
+        activityOwner,
+        pending: [],
+        expiresAt: Date.now() + 10_000,
+        releaseSnapshotActivity: beginCodeModeSnapshotActivity(activityOwner),
+      } as never);
+      resumingRunIds.add(parkedRunId);
+      return makeSuccessResult(attempt.providerOverride, attempt.modelOverride);
+    });
+    state.deliverAgentCommandResultMock.mockImplementation(async (params: unknown) => {
+      const result = requireRecord(requireRecord(params, "delivery params").result, "result");
+      expect(resolveEmbeddedRunAccountingObservers(result)).toBeUndefined();
+      expect(sampleCodeModeRunFinalQuiescence(activityOwner)).toBe("non_quiescent");
+      releaseControl?.();
+      return undefined;
+    });
+
+    await agentCommand({ message: "hello", to: "+1234567890", runId });
+
+    const accountingSnapshot = state.bindAgentCommandRunAccountingMock.mock.calls.at(-1)?.[1];
+    expect(accountingSnapshot).toMatchObject({
+      codeMode: {
+        engaged: true,
+        lifecycle: { finalQuiescence: { state: "non_quiescent" } },
+      },
+    });
+    expect(activeRuns.has(parkedRunId)).toBe(false);
+    expect(resumingRunIds.has(parkedRunId)).toBe(false);
+    expect(sampleCodeModeRunFinalQuiescence(activityOwner)).toBe("unavailable");
+    disposeCodeModeRun(parkedRunId);
+  });
+
+  it("samples terminal-only Code Mode quiescence when an attempt throws", async () => {
+    let activityOwner: CodeModeActivityOwner | undefined;
+    const failure = new Error("candidate failed before returning a result");
+    setupSingleAttemptFallback();
+    state.runAgentAttemptMock.mockImplementation(async (attemptParams: unknown) => {
+      const attempt = attemptParams as {
+        commandRunAccounting: {
+          readonly codeModeActivityOwner: CodeModeActivityOwner;
+          selectRuntime: (runtime: "embedded") => void;
+        };
+      };
+      attempt.commandRunAccounting.selectRuntime("embedded");
+      activityOwner = attempt.commandRunAccounting.codeModeActivityOwner;
+      registerCodeModeRunActivity(activityOwner);
+      beginCodeModeControlActivity(activityOwner)();
+      throw failure;
+    });
+
+    await expect(runBasicAgentCommand()).rejects.toBe(failure);
+
+    expect(resolveAgentCommandRunAccounting(failure)).toMatchObject({
+      codeMode: {
+        engaged: true,
+        lifecycle: { finalQuiescence: { state: "quiescent" } },
+      },
+    });
+    expect(sampleCodeModeRunFinalQuiescence(activityOwner)).toBe("unavailable");
+  });
+
+  it("isolates sequential commands that reuse the default session-derived run id", async () => {
+    const owners: CodeModeActivityOwner[] = [];
+    const runIds: string[] = [];
+    setupSingleAttemptFallback();
+    state.runAgentAttemptMock.mockImplementation(async (attemptParams: unknown) => {
+      const attempt = attemptParams as {
+        runId: string;
+        providerOverride: string;
+        modelOverride: string;
+        commandRunAccounting: {
+          readonly codeModeActivityOwner: CodeModeActivityOwner;
+        };
+      };
+      const owner = attempt.commandRunAccounting.codeModeActivityOwner;
+      owners.push(owner);
+      runIds.push(attempt.runId);
+      registerCodeModeRunActivity(owner);
+      const release = beginCodeModeControlActivity(owner);
+      release();
+      return makeSuccessResult(attempt.providerOverride, attempt.modelOverride);
+    });
+
+    await runBasicAgentCommand();
+    await runBasicAgentCommand();
+
+    expect(owners).toHaveLength(2);
+    expect(runIds).toEqual(["session-1", "session-1"]);
+    expect(owners[0]).not.toBe(owners[1]);
+    expect(sampleCodeModeRunFinalQuiescence(owners[0])).toBe("unavailable");
+    expect(sampleCodeModeRunFinalQuiescence(owners[1])).toBe("unavailable");
+  });
+
+  it("isolates overlapping commands with the same explicit public run id", async () => {
+    const sharedRunId = "duplicate-public-run-id";
+    const firstAttemptEntered = createDeferred();
+    const firstDeliveryEntered = createDeferred();
+    const secondDeliveryEntered = createDeferred();
+    const finishFirstDelivery = createDeferred();
+    const finishSecondDelivery = createDeferred();
+    const owners: CodeModeActivityOwner[] = [];
+    const releases: Array<() => void> = [];
+    setupSingleAttemptFallback();
+    state.runAgentAttemptMock.mockImplementation(async (attemptParams: unknown) => {
+      const attempt = attemptParams as {
+        providerOverride: string;
+        modelOverride: string;
+        commandRunAccounting: {
+          readonly codeModeActivityOwner: CodeModeActivityOwner;
+        };
+      };
+      const owner = attempt.commandRunAccounting.codeModeActivityOwner;
+      owners.push(owner);
+      registerCodeModeRunActivity(owner);
+      releases.push(beginCodeModeControlActivity(owner));
+      if (owners.length === 1) {
+        firstAttemptEntered.resolve();
+      }
+      return makeSuccessResult(attempt.providerOverride, attempt.modelOverride);
+    });
+    state.deliverAgentCommandResultMock.mockImplementation(async () => {
+      const deliveryOrdinal = state.deliverAgentCommandResultMock.mock.calls.length;
+      if (deliveryOrdinal === 1) {
+        firstDeliveryEntered.resolve();
+        await finishFirstDelivery.promise;
+        releases[0]?.();
+      } else {
+        secondDeliveryEntered.resolve();
+        await finishSecondDelivery.promise;
+        releases[1]?.();
+      }
+      return undefined;
+    });
+
+    state.sessionEntryMock = createCommandSessionEntry({ sessionId: "session-overlap-a" });
+    state.resolvedSessionKeyMock = "agent:main:overlap-a";
+    const first = agentCommand({
+      message: "first",
+      to: "+1234567890",
+      runId: sharedRunId,
+    });
+    await firstAttemptEntered.promise;
+
+    state.sessionEntryMock = createCommandSessionEntry({ sessionId: "session-overlap-b" });
+    state.resolvedSessionKeyMock = "agent:main:overlap-b";
+    const second = agentCommand({
+      message: "second",
+      to: "+1234567890",
+      runId: sharedRunId,
+    });
+    await Promise.all([firstDeliveryEntered.promise, secondDeliveryEntered.promise]);
+
+    expect(owners).toHaveLength(2);
+    expect(owners[0]).not.toBe(owners[1]);
+    expect(sampleCodeModeRunFinalQuiescence(owners[0])).toBe("non_quiescent");
+    expect(sampleCodeModeRunFinalQuiescence(owners[1])).toBe("non_quiescent");
+
+    finishFirstDelivery.resolve();
+    await first;
+    expect(sampleCodeModeRunFinalQuiescence(owners[0])).toBe("unavailable");
+    expect(sampleCodeModeRunFinalQuiescence(owners[1])).toBe("non_quiescent");
+
+    finishSecondDelivery.resolve();
+    await second;
+    expect(sampleCodeModeRunFinalQuiescence(owners[1])).toBe("unavailable");
   });
 
   it("retains accounting on a thrown non-switch provider failure", async () => {
@@ -4391,6 +4608,7 @@ describe("agentCommand – LiveSessionModelSwitchError retry", () => {
 
   it("classifies empty embedded run results before model fallback accepts them", async () => {
     let observedClassification: unknown;
+    let winningOwner: CodeModeActivityOwner | undefined;
     state.runWithModelFallbackMock.mockImplementation(async (params: FallbackRunnerParams) => {
       const primaryResult = await params.run(params.provider, params.model);
       observedClassification = await params.classifyResult?.({
@@ -4417,8 +4635,20 @@ describe("agentCommand – LiveSessionModelSwitchError retry", () => {
       };
     });
     state.runAgentAttemptMock
-      .mockResolvedValueOnce(makeEmptyResult("anthropic", "claude"))
-      .mockResolvedValueOnce(makeSuccessResult("openai", "gpt-5.4"));
+      .mockImplementationOnce(async (attemptParams: unknown) => {
+        const attempt = attemptParams as {
+          commandRunAccounting: { readonly codeModeActivityOwner: CodeModeActivityOwner };
+        };
+        registerCodeModeRunActivity(attempt.commandRunAccounting.codeModeActivityOwner);
+        return makeEmptyResult("anthropic", "claude");
+      })
+      .mockImplementationOnce(async (attemptParams: unknown) => {
+        const attempt = attemptParams as {
+          commandRunAccounting: { readonly codeModeActivityOwner: CodeModeActivityOwner };
+        };
+        winningOwner = attempt.commandRunAccounting.codeModeActivityOwner;
+        return makeSuccessResult("openai", "gpt-5.4");
+      });
 
     await runBasicAgentCommand();
 
@@ -4437,6 +4667,8 @@ describe("agentCommand – LiveSessionModelSwitchError retry", () => {
       "delivery params",
     );
     const result = requireRecord(deliveryParams.result, "delivery result");
+    expect(resolveEmbeddedRunAccountingObservers(result)).toBeUndefined();
+    expect(sampleCodeModeRunFinalQuiescence(winningOwner)).toBe("unavailable");
     const meta = requireRecord(result.meta, "delivery result meta");
     const agentMeta = requireRecord(meta.agentMeta, "delivery agent meta");
     const fallbackAttempts = requireArray(agentMeta.fallbackAttempts, "fallback attempts");

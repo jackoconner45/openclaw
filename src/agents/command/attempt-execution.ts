@@ -1246,6 +1246,7 @@ export function runAgentAttempt(params: {
     bootstrapPromptWarningSignature,
   };
   bindEmbeddedRunAccountingObservers(embeddedRunParams, {
+    codeModeActivityOwner: params.commandRunAccounting?.codeModeActivityOwner,
     onAgentSubmission: params.commandRunAccounting?.beginAgentSubmission,
     onAttemptObserved: params.commandRunAccounting?.observeEmbeddedAttempt,
     onRuntimeSelected: params.commandRunAccounting?.selectRuntime,

@@ -7,6 +7,10 @@ import { getAgentToolExecutionContext } from "../../packages/agent-core/src/tool
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { HookContext } from "./agent-tools.before-tool-call.js";
 import {
+  beginCodeModeControlActivity,
+  type CodeModeActivityContext,
+} from "./code-mode-activity.js";
+import {
   codeModeReplayIdForToolCall,
   runBridgeRequest,
   setCodeModeSwarmDepsForTest,
@@ -72,7 +76,7 @@ export {
 };
 export type { CodeModeFailureCode, CodeModeHeadlessResult } from "./code-mode-runtime.js";
 
-type CodeModeToolContext = ToolSearchToolContext;
+type CodeModeToolContext = ToolSearchToolContext & CodeModeActivityContext;
 
 const MAX_CODE_MODE_CATALOG_INDEX_CHARS = 8_000;
 
@@ -206,6 +210,7 @@ export function createCodeModeTools(ctx: CodeModeToolContext): AnyAgentTool[] {
     ) => {
       const stats = ensureCodeModeStats(ctx.catalogRef);
       recordCodeModeControlCall(stats, "exec");
+      const releaseActivity = beginCodeModeControlActivity(ctx.codeModeActivityOwner);
       let outcome: "completed" | "waiting" | "failed" | "aborted" = "failed";
       try {
         const input = readCode(args);
@@ -232,6 +237,7 @@ export function createCodeModeTools(ctx: CodeModeToolContext): AnyAgentTool[] {
           result.status === "failed" && result.code === "aborted" ? "aborted" : result.status;
         return formatToolSearchControlResult(result, runtime);
       } finally {
+        releaseActivity();
         recordCodeModeOutcome(stats, outcome);
       }
     },
@@ -252,6 +258,7 @@ export function createCodeModeTools(ctx: CodeModeToolContext): AnyAgentTool[] {
     ) => {
       const stats = ensureCodeModeStats(ctx.catalogRef);
       recordCodeModeControlCall(stats, "wait");
+      const releaseActivity = beginCodeModeControlActivity(ctx.codeModeActivityOwner);
       let outcome: "completed" | "waiting" | "failed" | "aborted" = "failed";
       try {
         let runtime: ToolSearchRuntime | undefined;
@@ -271,6 +278,7 @@ export function createCodeModeTools(ctx: CodeModeToolContext): AnyAgentTool[] {
           result.status === "failed" && result.code === "aborted" ? "aborted" : result.status;
         return formatToolSearchControlResult(result, runtime);
       } finally {
+        releaseActivity();
         recordCodeModeOutcome(stats, outcome);
       }
     },
