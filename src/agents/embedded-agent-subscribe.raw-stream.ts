@@ -33,11 +33,15 @@ export function appendRawStream(payload: Record<string, unknown>) {
       // ignore raw stream mkdir failures
     }
   }
-  void appendRegularFile({
-    filePath: rawStreamPath,
-    content: `${JSON.stringify(payload)}\n`,
-    rejectSymlinkParents: true,
-  }).catch(() => {
-    // ignore raw stream write failures
-  });
+  try {
+    void appendRegularFile({
+      filePath: rawStreamPath,
+      content: `${JSON.stringify(payload)}\n`,
+      rejectSymlinkParents: true,
+    }).catch(() => {
+      // ignore raw stream write failures
+    });
+  } catch {
+    // ignore synchronous failures before the promise is returned
+  }
 }
