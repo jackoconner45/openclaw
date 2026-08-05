@@ -1587,6 +1587,7 @@
           ]
         },
         "channelHostConfig": {
+          "docsSource": "official",
           "compatibilityMigration": "qqbot.tencent-2.0-compatibility",
           "schemaAllOf": [
             {

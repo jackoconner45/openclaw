@@ -512,6 +512,7 @@ describe("buildOfficialChannelCatalog", () => {
     });
     expect(entries.find((entry) => entry.id === "wecom")?.docsPath).toBe("/channels/wecom");
     expect(entries.find((entry) => entry.id === "yuanbao")?.docsPath).toBe("/channels/yuanbao");
+    expect(entries.find((entry) => entry.id === "qqbot")?.source).toBe("official");
   });
 
   it("uses the canonical channel docs route when a manifest omits docsPath", () => {

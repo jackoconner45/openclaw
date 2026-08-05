@@ -1106,6 +1106,51 @@ describe("channelsAddCommand", () => {
     expect(runtime.exit).not.toHaveBeenCalled();
   });
 
+  it("normalizes external channel compatibility before a non-interactive write", async () => {
+    configMocks.readConfigFileSnapshot.mockResolvedValue({ ...baseConfigSnapshot });
+    setActivePluginRegistry(
+      createTestRegistry([
+        {
+          pluginId: "openclaw-qqbot",
+          plugin: {
+            ...createChannelTestPluginBase({ id: "qqbot", label: "QQ Bot" }),
+            setup: {
+              applyAccountConfig: ({ cfg, input }: ApplyAccountConfigParams) => ({
+                ...cfg,
+                channels: {
+                  ...cfg.channels,
+                  qqbot: {
+                    appId: input.appId,
+                    clientSecret: input.clientSecret,
+                    allowFrom: ["*"],
+                  },
+                },
+              }),
+            },
+          },
+          source: "test",
+        },
+      ]),
+    );
+
+    await channelsAddCommand(
+      {
+        channel: "qqbot",
+        appId: "app-id",
+        clientSecret: "secret",
+      },
+      runtime,
+      { hasFlags: true },
+    );
+
+    expect(writtenChannel("qqbot")).toMatchObject({
+      appId: "app-id",
+      clientSecret: "secret",
+      dmPolicy: "open",
+      allowFrom: ["openclaw:approval-disabled"],
+    });
+  });
+
   it("uses setup-entry snapshots when an already loaded channel plugin has no setup adapter", async () => {
     configMocks.readConfigFileSnapshot.mockResolvedValue({ ...baseConfigSnapshot });
     setActivePluginRegistry(
