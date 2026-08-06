@@ -98,7 +98,7 @@ export function getFrontierEvidenceTaskDigest(): string | undefined {
 
 export function computeFrontierEvidenceDigest(
   key: string,
-  domain: "task" | "full-input" | "comparable-input" | "tool-schema",
+  domain: "task" | "full-input" | "comparable-input" | "logical-call" | "tool-schema",
   value: string,
 ): string {
   return createHmac("sha256", Buffer.from(key, "hex"))

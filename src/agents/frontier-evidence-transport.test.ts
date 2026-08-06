@@ -134,7 +134,7 @@ describe("frontier evidence prepared-route guard", () => {
   it("requires an exact current-turn timestamp envelope before the provider runs", () => {
     const bound = bind();
     const model = attempt().model;
-    const options = { apiKey: "test" };
+    const options = { apiKey: "test", requestId: "provider-call-1" };
 
     expect(() =>
       bound.streamFn(
@@ -162,6 +162,30 @@ describe("frontier evidence prepared-route guard", () => {
         options,
       ),
     ).not.toThrow();
+  });
+
+  it("requires the provider ledger call id before the provider runs", () => {
+    const bound = bind();
+
+    expect(() =>
+      bound.streamFn(
+        attempt().model,
+        {
+          messages: [
+            {
+              role: "user",
+              content: "[Thu 2026-08-06 12:34 UTC] hello",
+              timestamp: 1,
+            },
+          ],
+        },
+        { apiKey: "test" },
+      ),
+    ).toThrowError(
+      expect.objectContaining({
+        code: "comparable_input_binding_mismatch",
+      }),
+    );
   });
 
   it("rejects route or auth drift before the stream can run", () => {

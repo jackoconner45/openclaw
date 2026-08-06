@@ -1,5 +1,8 @@
+import { resolveAgentCommandRunAccounting } from "../agents/command/run-accounting.js";
 import type { EmbeddedAgentRunMeta } from "../agents/embedded-agent.js";
+import type { FrontierEvidencePolicy } from "../agents/frontier-evidence-policy.js";
 import type { FrontierEvidenceSnapshot } from "../agents/frontier-evidence-transport-policy.js";
+import { projectAgentExecTrace, type AgentExecTrace } from "./agent-exec-trace.js";
 
 export type AgentExecPayload = {
   text?: string;
@@ -32,6 +35,7 @@ export type AgentExecEnvelope = {
   codeModeStats?: NonNullable<NonNullable<EmbeddedAgentRunMeta["agentMeta"]>["codeModeStats"]>;
   toolSummary?: NonNullable<EmbeddedAgentRunMeta["toolSummary"]>;
   frontierEvidence?: FrontierEvidenceSnapshot[];
+  trace?: AgentExecTrace;
   model: string | null;
   provider: string | null;
   sessionId: string;
@@ -84,6 +88,10 @@ export function classifyAgentExecResult(
   result: AgentExecRunResult,
   fallbackExhausted = false,
   projectedErrorPayload?: string | true,
+  frontierEvidence?: {
+    policy: FrontierEvidencePolicy;
+    receipts: readonly FrontierEvidenceSnapshot[];
+  },
 ): AgentExecEnvelope {
   const meta = result.meta;
   const errorPayload = firstErrorPayload(result);
@@ -133,6 +141,15 @@ export function classifyAgentExecResult(
               ? "agent_error"
               : undefined;
   const agentMeta = meta.agentMeta;
+  const trace = projectAgentExecTrace({
+    snapshot: resolveAgentCommandRunAccounting(meta),
+    agentDurationMs: meta.durationMs,
+    codeModeEngaged: agentMeta?.codeModeEngaged,
+    frontierPolicy: frontierEvidence?.policy,
+    frontierEvidence: frontierEvidence?.receipts,
+    model: agentMeta?.model,
+    provider: agentMeta?.provider,
+  });
   return {
     ok: status === "ok",
     status,
@@ -149,6 +166,7 @@ export function classifyAgentExecResult(
     ...(agentMeta?.bridgeCalls ? { bridgeCalls: agentMeta.bridgeCalls } : {}),
     ...(agentMeta?.codeModeStats ? { codeModeStats: agentMeta.codeModeStats } : {}),
     ...(meta.toolSummary ? { toolSummary: meta.toolSummary } : {}),
+    ...(trace ? { trace } : {}),
     model: agentMeta?.model ?? null,
     provider: agentMeta?.provider ?? null,
     sessionId: agentMeta?.sessionId ?? "",

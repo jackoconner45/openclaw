@@ -85,8 +85,10 @@ function beginLogicalCall(
   binding: ReturnType<typeof createBinding>,
   bindings: FrontierEvidenceVolatileBindings = volatileBindings,
 ): void {
-  binding.beginLogicalCall(bindings);
+  binding.beginLogicalCall(bindings, `provider-call-${String(nextLogicalCallId++)}`);
 }
+
+let nextLogicalCallId = 1;
 
 function request(
   overrides: Partial<OpenAIResponsesRequestParams & Record<string, unknown>> = {},
@@ -158,6 +160,7 @@ describe("frontier evidence policy guard", () => {
       callSequences: [
         {
           logicalCallOrdinal: 1,
+          logicalCallBindingId: expect.stringMatching(/^[a-f0-9]{64}$/u),
           requestCount: 1,
           fetchDispatchCount: 1,
           payloadVariants: ["initial"],
@@ -538,6 +541,28 @@ describe("frontier evidence policy guard", () => {
       fetchDispatchObservations: 0,
       mismatchCodes: ["observation_missing"],
     });
+  });
+
+  it("rejects reuse of a provider ledger call id", () => {
+    const binding = createBinding();
+    binding.beginLogicalCall(volatileBindings, "provider-call-fixed");
+    assertFrontierEvidenceRequest({
+      binding,
+      model,
+      request: request(),
+      payloadVariant: "initial",
+    });
+    assertFrontierEvidenceFetchDispatch({
+      binding,
+      url: "https://api.openai.com/v1/responses",
+      method: "POST",
+    });
+
+    expect(() => binding.beginLogicalCall(volatileBindings, "provider-call-fixed")).toThrowError(
+      expect.objectContaining<Partial<FrontierEvidenceMismatchError>>({
+        code: "comparable_input_binding_mismatch",
+      }),
+    );
   });
 
   it.each([

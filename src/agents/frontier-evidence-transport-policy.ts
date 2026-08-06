@@ -80,6 +80,7 @@ export type FrontierEvidenceSnapshot = {
   payloadVariants: OpenAIResponsesPayloadVariant[];
   callSequences: Array<{
     logicalCallOrdinal: number;
+    logicalCallBindingId: string;
     requestCount: number;
     fetchDispatchCount: number;
     payloadVariants: OpenAIResponsesPayloadVariant[];
@@ -120,7 +121,10 @@ type FrontierEvidenceCollector = {
 export type FrontierEvidenceBinding = {
   policy: FrontierEvidencePolicy;
   collector: FrontierEvidenceCollector;
-  beginLogicalCall: (bindings: FrontierEvidenceVolatileBindings) => void;
+  beginLogicalCall: (
+    bindings: FrontierEvidenceVolatileBindings,
+    providerLogicalCallId: string,
+  ) => void;
   expectedPromptCacheKey: string;
   taskDigest: string;
   activeVolatileBindings?: FrontierEvidenceVolatileBindings;
@@ -139,6 +143,7 @@ export function createFrontierEvidenceBinding(
   const observedPayloadVariants = new Set<OpenAIResponsesPayloadVariant>();
   const requestFetchDispatchCounts = new Map<string, number>();
   const callPayloadVariants = new Map<number, OpenAIResponsesPayloadVariant[]>();
+  const logicalCallBindingIds = new Map<number, string>();
   const observationLimit = policy.maxLogicalCalls * FRONTIER_EVIDENCE_OBSERVATIONS_PER_LOGICAL_CALL;
   let truncated = false;
   let valid = true;
@@ -251,6 +256,7 @@ export function createFrontierEvidenceBinding(
             }));
           return {
             logicalCallOrdinal: ordinal,
+            logicalCallBindingId: logicalCallBindingIds.get(ordinal) ?? "",
             requestCount: requests.length,
             fetchDispatchCount: requests.reduce(
               (total, request) => total + request.fetchDispatchCount,
@@ -265,6 +271,7 @@ export function createFrontierEvidenceBinding(
         logicalCallOrdinal === 0 ||
         callSequences.some(
           (sequence) =>
+            !/^[a-f0-9]{64}$/u.test(sequence.logicalCallBindingId) ||
             sequence.requestCount === 0 ||
             sequence.requests.some(
               (request) =>
@@ -304,7 +311,7 @@ export function createFrontierEvidenceBinding(
     collector,
     expectedPromptCacheKey: runtime.promptCacheKey,
     taskDigest: runtime.taskDigest,
-    beginLogicalCall(bindings) {
+    beginLogicalCall(bindings, providerLogicalCallId) {
       if (
         logicalCallOrdinal > 0 &&
         (requestOrdinal === 0 ||
@@ -323,12 +330,26 @@ export function createFrontierEvidenceBinding(
         throw new FrontierEvidenceMismatchError("logical_call_limit");
       }
       const values = Object.values(bindings);
-      if (values.some((value) => !value) || new Set(values).size !== values.length) {
+      const normalizedLogicalCallId = providerLogicalCallId.trim();
+      const logicalCallBindingId = normalizedLogicalCallId
+        ? computeFrontierEvidenceDigest(
+            policy.contentDigestKey,
+            "logical-call",
+            normalizedLogicalCallId,
+          )
+        : "";
+      if (
+        values.some((value) => !value) ||
+        new Set(values).size !== values.length ||
+        !logicalCallBindingId ||
+        [...logicalCallBindingIds.values()].includes(logicalCallBindingId)
+      ) {
         valid = false;
         mismatchCodes.add("comparable_input_binding_mismatch");
         throw new FrontierEvidenceMismatchError("comparable_input_binding_mismatch");
       }
       logicalCallOrdinal += 1;
+      logicalCallBindingIds.set(logicalCallOrdinal, logicalCallBindingId);
       requestOrdinal = 0;
       physicalDispatchOrdinal = 0;
       binding.activeVolatileBindings = bindings;

@@ -175,15 +175,22 @@ export function bindFrontierEvidenceTransport(params: {
   const binding = createFrontierEvidenceBinding(policy, { promptCacheKey, taskDigest });
   registerFrontierEvidenceBinding(binding);
   const streamFn: StreamFn = (model, context, options) => {
+    const providerLogicalCallId = options?.requestId?.trim();
+    if (!providerLogicalCallId) {
+      reject("comparable_input_binding_mismatch");
+    }
     const currentTurnTimestampEnvelope = readCurrentTurnTimestampEnvelope(context);
     if (!currentTurnTimestampEnvelope) {
       reject("comparable_input_binding_mismatch");
     }
-    binding.beginLogicalCall({
-      workspacePath: params.attempt.workspaceDir,
-      sessionId: params.attempt.sessionId,
-      currentTurnTimestampEnvelope,
-    });
+    binding.beginLogicalCall(
+      {
+        workspacePath: params.attempt.workspaceDir,
+        sessionId: params.attempt.sessionId,
+        currentTurnTimestampEnvelope,
+      },
+      providerLogicalCallId,
+    );
     const boundOptions = { ...options };
     // This trusted binding is installed after every provider/config wrapper, so
     // caller-supplied symbols cannot replace the policy observed at fetch dispatch.

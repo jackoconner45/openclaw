@@ -585,7 +585,14 @@ export async function agentExecCommand(
     if (!result) {
       throw new Error("Agent run returned no result");
     }
-    const envelope = classifyAgentExecResult(result, fallbackExhausted, resultErrorPayload);
+    const envelope = classifyAgentExecResult(
+      result,
+      fallbackExhausted,
+      resultErrorPayload,
+      frontierEvidence && frontierEvidenceReceipt
+        ? { policy: frontierEvidence.policy, receipts: frontierEvidenceReceipt }
+        : undefined,
+    );
     if (frontierEvidenceReceipt) {
       envelope.frontierEvidence = frontierEvidenceReceipt;
     }
