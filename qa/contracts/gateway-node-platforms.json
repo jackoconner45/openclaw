@@ -1,0 +1,318 @@
+{
+  "kind": "openclaw.gateway-node-platform-coverage-inventory",
+  "platforms": [
+    {
+      "platform": "macos",
+      "topology": {
+        "kind": "direct-ws",
+        "gatewayNegotiator": "macos",
+        "edges": [
+          {
+            "from": "macos",
+            "to": "gateway",
+            "transport": "websocket"
+          }
+        ]
+      },
+      "implementationOwners": [
+        {
+          "repository": "openclaw/openclaw",
+          "path": "apps/macos/Sources/OpenClaw/NodeMode/MacNodeModeCoordinator.swift"
+        },
+        {
+          "repository": "openclaw/openclaw",
+          "path": "apps/shared/OpenClawKit/Sources/OpenClawKit/GatewayChannel.swift"
+        }
+      ],
+      "availableCoverage": [
+        {
+          "name": "macos-node-connect-source",
+          "tier": "source",
+          "owner": {
+            "repository": "openclaw/openclaw",
+            "path": "apps/macos/Sources/OpenClaw/NodeMode/MacNodeModeCoordinator.swift"
+          }
+        },
+        {
+          "name": "macos-node-connect-unit",
+          "tier": "unit",
+          "owner": {
+            "repository": "openclaw/openclaw",
+            "path": "apps/macos/Tests/OpenClawIPCTests/MacNodeModeCoordinatorTests.swift"
+          }
+        }
+      ],
+      "currentRunEvidence": [],
+      "releaseSelection": {
+        "scope": "full-release-validation",
+        "status": "not-selected",
+        "reason": "no-native-evidence-ingestion"
+      }
+    },
+    {
+      "platform": "ios",
+      "topology": {
+        "kind": "direct-ws",
+        "gatewayNegotiator": "ios",
+        "edges": [
+          {
+            "from": "ios",
+            "to": "gateway",
+            "transport": "websocket"
+          }
+        ]
+      },
+      "implementationOwners": [
+        {
+          "repository": "openclaw/openclaw",
+          "path": "apps/ios/Sources/Model/NodeAppModel.swift"
+        },
+        {
+          "repository": "openclaw/openclaw",
+          "path": "apps/shared/OpenClawKit/Sources/OpenClawKit/GatewayChannel.swift"
+        }
+      ],
+      "availableCoverage": [
+        {
+          "name": "ios-node-connect-source",
+          "tier": "source",
+          "owner": {
+            "repository": "openclaw/openclaw",
+            "path": "apps/ios/Sources/Model/NodeAppModel.swift"
+          }
+        },
+        {
+          "name": "ios-node-lifecycle-simulator",
+          "tier": "simulator",
+          "owner": {
+            "repository": "openclaw/openclaw",
+            "path": "apps/ios/Tests/NodeAppModelInvokeTests.swift"
+          }
+        },
+        {
+          "name": "ios-gateway-node-server-contract",
+          "tier": "server-contract",
+          "owner": {
+            "repository": "openclaw/openclaw",
+            "path": "test/e2e/qa-lab/runtime/gateway-node-control-plane.e2e.test.ts"
+          }
+        }
+      ],
+      "currentRunEvidence": [],
+      "releaseSelection": {
+        "scope": "full-release-validation",
+        "status": "not-selected",
+        "reason": "no-native-evidence-ingestion"
+      }
+    },
+    {
+      "platform": "watchos",
+      "topology": {
+        "kind": "watch-http",
+        "gatewayNegotiator": "watchos",
+        "edges": [
+          {
+            "from": "watchos",
+            "to": "gateway",
+            "transport": "bounded-https-challenge-connect-poll"
+          }
+        ]
+      },
+      "implementationOwners": [
+        {
+          "repository": "openclaw/openclaw",
+          "path": "apps/ios/WatchApp/Sources/WatchDirectNode.swift"
+        },
+        {
+          "repository": "openclaw/openclaw",
+          "path": "src/gateway/watch-node-http.ts"
+        }
+      ],
+      "availableCoverage": [
+        {
+          "name": "watchos-direct-http-source",
+          "tier": "source",
+          "owner": {
+            "repository": "openclaw/openclaw",
+            "path": "apps/ios/WatchApp/Sources/WatchDirectNode.swift"
+          }
+        },
+        {
+          "name": "watchos-native-protocol-unit",
+          "tier": "unit",
+          "owner": {
+            "repository": "openclaw/openclaw",
+            "path": "packages/gateway-protocol/src/native-protocol-levels.guard.test.ts"
+          }
+        },
+        {
+          "name": "watchos-http-server-contract",
+          "tier": "server-contract",
+          "owner": {
+            "repository": "openclaw/openclaw",
+            "path": "src/gateway/watch-node-http.test.ts"
+          }
+        }
+      ],
+      "currentRunEvidence": [],
+      "releaseSelection": {
+        "scope": "full-release-validation",
+        "status": "not-selected",
+        "reason": "no-native-evidence-ingestion"
+      }
+    },
+    {
+      "platform": "android",
+      "topology": {
+        "kind": "direct-ws",
+        "gatewayNegotiator": "android",
+        "edges": [
+          {
+            "from": "android",
+            "to": "gateway",
+            "transport": "websocket"
+          }
+        ]
+      },
+      "implementationOwners": [
+        {
+          "repository": "openclaw/openclaw",
+          "path": "apps/android/app/src/main/java/ai/openclaw/app/gateway/GatewaySession.kt"
+        }
+      ],
+      "availableCoverage": [
+        {
+          "name": "android-node-connect-source",
+          "tier": "source",
+          "owner": {
+            "repository": "openclaw/openclaw",
+            "path": "apps/android/app/src/main/java/ai/openclaw/app/gateway/GatewaySession.kt"
+          }
+        },
+        {
+          "name": "android-node-connect-unit",
+          "tier": "unit",
+          "owner": {
+            "repository": "openclaw/openclaw",
+            "path": "apps/android/app/src/test/java/ai/openclaw/app/gateway/GatewaySessionInvokeTest.kt"
+          }
+        }
+      ],
+      "currentRunEvidence": [],
+      "releaseSelection": {
+        "scope": "full-release-validation",
+        "status": "not-selected",
+        "reason": "no-native-evidence-ingestion"
+      }
+    },
+    {
+      "platform": "wearos",
+      "topology": {
+        "kind": "wear-two-hop",
+        "gatewayNegotiator": "android-phone",
+        "edges": [
+          {
+            "from": "wearos",
+            "to": "android-phone",
+            "transport": "wear-message-api-data-layer"
+          },
+          {
+            "from": "android-phone",
+            "to": "gateway",
+            "transport": "websocket"
+          }
+        ]
+      },
+      "implementationOwners": [
+        {
+          "repository": "openclaw/openclaw",
+          "path": "apps/android/wear/src/main/java/ai/openclaw/wear/WearProxyClient.kt"
+        },
+        {
+          "repository": "openclaw/openclaw",
+          "path": "apps/android/app/src/main/java/ai/openclaw/app/wear/WearProxyBridge.kt"
+        },
+        {
+          "repository": "openclaw/openclaw",
+          "path": "apps/android/app/src/main/java/ai/openclaw/app/gateway/GatewaySession.kt"
+        }
+      ],
+      "availableCoverage": [
+        {
+          "name": "wearos-data-layer-source",
+          "tier": "source",
+          "owner": {
+            "repository": "openclaw/openclaw",
+            "path": "apps/android/wear/src/main/java/ai/openclaw/wear/WearProxyClient.kt"
+          }
+        },
+        {
+          "name": "wearos-phone-proxy-source",
+          "tier": "source",
+          "owner": {
+            "repository": "openclaw/openclaw",
+            "path": "apps/android/app/src/main/java/ai/openclaw/app/wear/WearProxyBridge.kt"
+          }
+        },
+        {
+          "name": "wearos-data-layer-unit",
+          "tier": "unit",
+          "owner": {
+            "repository": "openclaw/openclaw",
+            "path": "apps/android/wear/src/test/java/ai/openclaw/wear/WearProxyClientTest.kt"
+          }
+        },
+        {
+          "name": "wearos-phone-proxy-unit",
+          "tier": "unit",
+          "owner": {
+            "repository": "openclaw/openclaw",
+            "path": "apps/android/app/src/test/java/ai/openclaw/app/wear/WearProxyBridgeTest.kt"
+          }
+        }
+      ],
+      "currentRunEvidence": [],
+      "releaseSelection": {
+        "scope": "full-release-validation",
+        "status": "not-selected",
+        "reason": "no-native-evidence-ingestion"
+      }
+    },
+    {
+      "platform": "windows",
+      "topology": {
+        "kind": "direct-ws",
+        "gatewayNegotiator": "windows",
+        "edges": [
+          {
+            "from": "windows",
+            "to": "gateway",
+            "transport": "websocket"
+          }
+        ]
+      },
+      "implementationOwners": [
+        {
+          "repository": "openclaw/openclaw-windows-node",
+          "path": null
+        }
+      ],
+      "availableCoverage": [
+        {
+          "name": "windows-node-external-source",
+          "tier": "source",
+          "owner": {
+            "repository": "openclaw/openclaw-windows-node",
+            "path": null
+          }
+        }
+      ],
+      "currentRunEvidence": [],
+      "releaseSelection": {
+        "scope": "full-release-validation",
+        "status": "not-selected",
+        "reason": "no-native-evidence-ingestion"
+      }
+    }
+  ]
+}
