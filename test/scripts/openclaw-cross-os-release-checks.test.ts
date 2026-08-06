@@ -42,6 +42,9 @@ import {
   buildRealUpdateEnv,
   dashboardHtmlMarkerStatus,
   CROSS_OS_FETCH_BODY_MAX_CHARS,
+  GATEWAY_NODE_COMPAT_BASELINE_SPEC,
+  GATEWAY_NODE_COMPAT_BASELINE_TAG,
+  GATEWAY_NODE_COMPAT_BASELINE_VERSION,
   CROSS_OS_GATEWAY_READY_TIMEOUT_MS,
   CROSS_OS_GATEWAY_STATUS_COMMAND_TIMEOUT_MS,
   CROSS_OS_GATEWAY_STATUS_RPC_TIMEOUT_MS,
@@ -708,6 +711,56 @@ describe("scripts/openclaw-cross-os-release-checks", () => {
       "OPENCLAW_CROSS_OS_OPENAI_MODEL: ${{ inputs.openai_model || vars.OPENCLAW_CROSS_OS_OPENAI_MODEL || 'openai/gpt-5.6-luna' }}",
     );
     expect(releaseChecks).toContain("openai_model: openai/gpt-5.6-luna");
+  });
+
+  it("wires the required Linux x64 Gateway/node compatibility producer", () => {
+    const workflow = readFileSync(
+      ".github/workflows/openclaw-cross-os-release-checks-reusable.yml",
+      "utf8",
+    );
+
+    expect(GATEWAY_NODE_COMPAT_BASELINE_TAG).toBe("v2026.5.7");
+    expect(GATEWAY_NODE_COMPAT_BASELINE_VERSION).toBe("2026.5.7");
+    expect(GATEWAY_NODE_COMPAT_BASELINE_SPEC).toBe("openclaw@2026.5.7");
+    expect(workflow).toContain("gateway_node_linux_compat:");
+    expect(workflow).toContain("Gateway/node compatibility / Linux x64");
+    expect(workflow).toContain(
+      "openclaw-gateway-node-compat-baseline-${{ github.run_id }}-${{ github.run_attempt }}",
+    );
+    expect(workflow).toContain("--gateway-node-compat true");
+    expect(workflow).toContain("--compat-baseline-version");
+    expect(workflow).toContain(
+      '--candidate-artifact-run-id "${{ needs.prepare.outputs.candidate_artifact_run_id }}"',
+    );
+    expect(workflow).toContain(
+      '--candidate-artifact-run-attempt "${{ needs.prepare.outputs.candidate_artifact_run_attempt }}"',
+    );
+    expect(workflow).toContain(
+      '--compat-baseline-artifact-run-id "${{ needs.prepare.outputs.compat_baseline_artifact_run_id }}"',
+    );
+    expect(workflow).toContain(
+      '--compat-baseline-artifact-run-attempt "${{ needs.prepare.outputs.compat_baseline_artifact_run_attempt }}"',
+    );
+    expect(workflow).toContain(
+      "GATEWAY_NODE_COMPAT_WORKFLOW_SHA: ${{ needs.prepare.outputs.workflow_ref }}",
+    );
+    expect(workflow).toContain("GITHUB_TOKEN: ${{ github.token }}");
+    expect(workflow).not.toContain("Validate prepared compatibility artifact bindings");
+    expect(workflow).not.toContain("Verify compatibility package hashes");
+    expect(workflow).not.toContain("--workflow-sha");
+    expect(workflow).not.toContain("--candidate-artifact-size");
+    expect(workflow).not.toContain("--compat-baseline-artifact-size");
+    expect(workflow).not.toContain("--job gateway_node_linux_compat");
+    expect(workflow).toContain("gateway_node_compat_artifact_size:");
+    expect(workflow).toContain(
+      "artifact_size: ${{ steps.capture_gateway_node_compat_artifact.outputs.size }}",
+    );
+    expect(workflow).toContain(
+      "openclaw-gateway-node-linux-compat-${{ github.run_id }}-${{ github.run_attempt }}",
+    );
+    expect(workflow).toContain(
+      "gateway_node_linux_compat:\n    name: Gateway/node compatibility / Linux x64\n    needs: prepare\n    continue-on-error: ${{ inputs.advisory }}",
+    );
   });
 
   it("keeps release smoke plugin allowlists focused on agent-turn essentials", () => {

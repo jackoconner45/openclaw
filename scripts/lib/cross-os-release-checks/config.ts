@@ -97,6 +97,9 @@ export type SummaryPayload = {
 };
 
 export const PUBLISHED_INSTALLER_BASE_URL = "https://openclaw.ai";
+export const GATEWAY_NODE_COMPAT_BASELINE_TAG = "v2026.5.7";
+export const GATEWAY_NODE_COMPAT_BASELINE_VERSION = "2026.5.7";
+export const GATEWAY_NODE_COMPAT_BASELINE_SPEC = `openclaw@${GATEWAY_NODE_COMPAT_BASELINE_VERSION}`;
 
 const SUPPORTED_MODES = new Set<CrossOsMode>(["fresh", "upgrade", "both"]);
 const SUPPORTED_SUITES = new Set<CrossOsSuite>([
