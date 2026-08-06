@@ -39,9 +39,9 @@ export function appendRawStream(payload: Record<string, unknown>) {
       content: `${JSON.stringify(payload)}\n`,
       rejectSymlinkParents: true,
     }).catch(() => {
-      // ignore raw stream write failures
+      // Raw diagnostics are best-effort; filesystem failures must not terminate agent runs.
     });
   } catch {
-    // ignore synchronous failures before the promise is returned
+    // JSON serialization can fail synchronously, for example with cyclic payloads.
   }
 }

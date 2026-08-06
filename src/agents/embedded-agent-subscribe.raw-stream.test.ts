@@ -1,82 +1,86 @@
-/**
- * Tests for raw-stream write failure handling.
- * Verifies that both synchronous throws and async rejections are contained
- * without crashing the process.
- */
 import fs from "node:fs";
-import path from "node:path";
-import { randomUUID } from "node:crypto";
 import os from "node:os";
-import { beforeEach, describe, expect, it, vi } from "vitest";
-
-// Mock appendRegularFile before importing the module under test so we
-// control whether it resolves, rejects, or throws synchronously.
-const mockAppendRegularFile = vi.fn<(...args: unknown[]) => Promise<void>>();
-
-vi.mock("../infra/fs-safe.js", () => ({
-  appendRegularFile: (...args: unknown[]) => mockAppendRegularFile(...args),
-}));
-
-// Reload the module with our mock in place.
-const { appendRawStream } = await import(
-  "./embedded-agent-subscribe.raw-stream.js"
-);
+import path from "node:path";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { appendRawStream } from "./embedded-agent-subscribe.raw-stream.js";
 
 describe("appendRawStream", () => {
   let tmpDir: string;
+  const unhandledRejections: unknown[] = [];
+  const onUnhandledRejection = (reason: unknown) => {
+    unhandledRejections.push(reason);
+  };
+
+  beforeAll(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-raw-stream-test-"));
+  });
 
   beforeEach(() => {
     vi.stubEnv("OPENCLAW_RAW_STREAM", "true");
-    tmpDir = path.join(
-      os.tmpdir(),
-      `openclaw-raw-stream-test-${randomUUID()}`,
-    );
-    vi.stubEnv("OPENCLAW_RAW_STREAM_PATH", path.join(tmpDir, "raw.jsonl"));
-    mockAppendRegularFile.mockReset();
+    process.on("unhandledRejection", onUnhandledRejection);
   });
 
-  it("survives a rejected write without throwing", async () => {
-    mockAppendRegularFile.mockRejectedValue(
-      new Error("ENOSPC: no space left on device"),
-    );
-    expect(() => appendRawStream({ event: "test", ts: 1 })).not.toThrow();
-    // Let the microtask queue flush so the rejection reaches the catch handler.
-    await vi.waitFor(() => {
-      expect(mockAppendRegularFile).toHaveBeenCalledTimes(1);
+  afterEach(() => {
+    process.off("unhandledRejection", onUnhandledRejection);
+    unhandledRejections.length = 0;
+    vi.unstubAllEnvs();
+  });
+
+  afterAll(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  async function drainAsyncWrites(): Promise<void> {
+    await Promise.resolve();
+    await new Promise<void>((resolve) => {
+      setImmediate(resolve);
     });
-  });
+  }
 
-  it("survives a synchronous throw from the dependency", () => {
-    mockAppendRegularFile.mockImplementation(() => {
-      throw new Error("synchronous construction failure");
-    });
+  it("contains a real rejected append without leaking an unhandled rejection", async () => {
+    const directoryTarget = path.join(tmpDir, "directory-target");
+    fs.mkdirSync(directoryTarget);
+    vi.stubEnv("OPENCLAW_RAW_STREAM_PATH", directoryTarget);
+
     expect(() => appendRawStream({ event: "test", ts: 1 })).not.toThrow();
-    expect(mockAppendRegularFile).toHaveBeenCalledTimes(1);
+    await drainAsyncWrites();
+
+    expect(unhandledRejections).toHaveLength(0);
   });
 
-  it("writes successfully in the normal case", async () => {
-    fs.mkdirSync(tmpDir, { recursive: true });
-    try {
-      mockAppendRegularFile.mockResolvedValue(undefined);
-      expect(() => appendRawStream({ event: "test", ts: 1 })).not.toThrow();
-      await vi.waitFor(() => {
-        expect(mockAppendRegularFile).toHaveBeenCalledTimes(1);
-      });
-      expect(
-        mockAppendRegularFile,
-      ).toHaveBeenCalledWith({
-        filePath: path.join(tmpDir, "raw.jsonl"),
-        content: '{"event":"test","ts":1}\n',
-        rejectSymlinkParents: true,
-      });
-    } finally {
-      fs.rmSync(tmpDir, { recursive: true, force: true });
-    }
-  });
+  it("appends exact JSONL through the real dependency", async () => {
+    const rawStreamPath = path.join(tmpDir, "raw.jsonl");
+    vi.stubEnv("OPENCLAW_RAW_STREAM_PATH", rawStreamPath);
 
-  it("is a no-op when OPENCLAW_RAW_STREAM is not set", () => {
-    vi.stubEnv("OPENCLAW_RAW_STREAM", "");
     appendRawStream({ event: "test", ts: 1 });
-    expect(mockAppendRegularFile).not.toHaveBeenCalled();
+    await vi.waitFor(() => {
+      expect(fs.existsSync(rawStreamPath)).toBe(true);
+    });
+
+    expect(fs.readFileSync(rawStreamPath, "utf8")).toBe('{"event":"test","ts":1}\n');
+    expect(unhandledRejections).toHaveLength(0);
+  });
+
+  it("does nothing when raw streaming is disabled", async () => {
+    const rawStreamPath = path.join(tmpDir, "disabled.jsonl");
+    vi.stubEnv("OPENCLAW_RAW_STREAM", "");
+    vi.stubEnv("OPENCLAW_RAW_STREAM_PATH", rawStreamPath);
+
+    appendRawStream({ event: "test", ts: 1 });
+    await drainAsyncWrites();
+
+    expect(fs.existsSync(rawStreamPath)).toBe(false);
+    expect(unhandledRejections).toHaveLength(0);
+  });
+
+  it("contains synchronous JSON serialization failures", () => {
+    const rawStreamPath = path.join(tmpDir, "cyclic.jsonl");
+    const payload: Record<string, unknown> = {};
+    payload.self = payload;
+    vi.stubEnv("OPENCLAW_RAW_STREAM_PATH", rawStreamPath);
+
+    expect(() => appendRawStream(payload)).not.toThrow();
+    expect(fs.existsSync(rawStreamPath)).toBe(false);
+    expect(unhandledRejections).toHaveLength(0);
   });
 });
