@@ -74,9 +74,9 @@ const volatileBindings = {
   currentTurnTimestampEnvelope: "[Thu 2026-08-06 12:34 UTC] ",
 } satisfies FrontierEvidenceVolatileBindings;
 
-function createBinding() {
+function createBinding(promptCacheKey = "session:0") {
   return createFrontierEvidenceBinding(policy(), {
-    promptCacheKey: "session:0",
+    promptCacheKey,
     taskDigest: "e".repeat(64),
   });
 }
@@ -152,6 +152,7 @@ describe("frontier evidence policy guard", () => {
       policySha256: "a".repeat(64),
       authBindingId: "c".repeat(32),
       credentialState: "frozen_in_memory",
+      promptCacheKeyDigest: expect.stringMatching(/^[a-f0-9]{64}$/u),
       valid: true,
       logicalCalls: 1,
       requestObservations: 1,
@@ -179,8 +180,13 @@ describe("frontier evidence policy guard", () => {
       ],
       mismatchCodes: [],
     });
-    expect(JSON.stringify(binding.collector.snapshot())).not.toContain("OPENAI_API_KEY");
-    expect(JSON.stringify(binding.collector.snapshot())).not.toContain("/v1/responses");
+    const serialized = JSON.stringify(binding.collector.snapshot());
+    expect(serialized).not.toContain("OPENAI_API_KEY");
+    expect(serialized).not.toContain("/v1/responses");
+    expect(serialized).not.toContain("session:0");
+    expect(createBinding("session:1").collector.snapshot().promptCacheKeyDigest).not.toBe(
+      binding.collector.snapshot().promptCacheKeyDigest,
+    );
   });
 
   it("substitutes only declared volatile values in the final model-facing input", () => {

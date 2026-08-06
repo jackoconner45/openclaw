@@ -5,6 +5,7 @@ import { resolveDefaultAgentId } from "../agents/agent-scope-config.js";
 import { resolveAgentEffectiveModelPrimary } from "../agents/agent-scope.js";
 import type { AuthProfileStore } from "../agents/auth-profiles.js";
 import {
+  deriveFrontierEvidencePromptCacheKey,
   readFrontierEvidencePolicyFile,
   type FrontierEvidencePolicy,
 } from "../agents/frontier-evidence-policy.js";
@@ -17,6 +18,7 @@ type FrontierEvidenceCliOptions = {
   fallback?: string[];
   frontierEvidencePolicy?: string;
   frontierEvidencePolicySha256?: string;
+  frontierEvidenceRunNonce?: string;
   isolated?: boolean;
   model?: string;
   thinking?: string;
@@ -27,6 +29,7 @@ export type FrontierEvidenceExecution = {
   authStore: AuthProfileStore;
   authProfileId: string;
   credentialEnvName: string;
+  promptCacheKey: string;
 };
 
 export async function resolveFrontierEvidenceExecution(params: {
@@ -35,11 +38,20 @@ export async function resolveFrontierEvidenceExecution(params: {
 }): Promise<FrontierEvidenceExecution | undefined> {
   const policyPath = params.opts.frontierEvidencePolicy?.trim();
   const policySha256 = params.opts.frontierEvidencePolicySha256?.trim();
+  const runNonce = params.opts.frontierEvidenceRunNonce?.trim();
   if (!policyPath && !policySha256) {
+    if (runNonce) {
+      throw new Error("frontier evidence run nonce requires a frontier evidence policy");
+    }
     return undefined;
   }
-  if (!policyPath || !policySha256 || !params.opts.config) {
-    throw new Error("frontier evidence policy requires a pinned config, path, and SHA-256");
+  if (!policyPath || !policySha256 || !params.opts.config || !runNonce) {
+    throw new Error(
+      "frontier evidence policy requires a pinned config, path, SHA-256, and run nonce",
+    );
+  }
+  if (!/^[a-f0-9]{64}$/u.test(runNonce)) {
+    throw new Error("frontier evidence run nonce must be 64 lowercase hex characters");
   }
   if (
     params.opts.isolated ||
@@ -82,6 +94,7 @@ export async function resolveFrontierEvidenceExecution(params: {
     policy,
     authProfileId: qualified.profile,
     credentialEnvName: policy.credentialEnvName,
+    promptCacheKey: deriveFrontierEvidencePromptCacheKey(policy.contentDigestKey, runNonce),
     authStore: {
       version: 1,
       profiles: {

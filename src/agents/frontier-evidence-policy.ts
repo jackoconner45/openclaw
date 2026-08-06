@@ -98,12 +98,28 @@ export function getFrontierEvidenceTaskDigest(): string | undefined {
 
 export function computeFrontierEvidenceDigest(
   key: string,
-  domain: "task" | "full-input" | "comparable-input" | "logical-call" | "tool-schema",
+  domain:
+    | "task"
+    | "full-input"
+    | "comparable-input"
+    | "logical-call"
+    | "prompt-cache-key"
+    | "tool-schema",
   value: string,
 ): string {
   return createHmac("sha256", Buffer.from(key, "hex"))
     .update(`openclaw-frontier-${domain}-v1\0`)
     .update(value, "utf8")
+    .digest("hex");
+}
+
+export function deriveFrontierEvidencePromptCacheKey(key: string, runNonce: string): string {
+  if (!/^[a-f0-9]{64}$/u.test(runNonce)) {
+    throw new Error("frontier evidence run nonce must be a 256-bit lowercase hex value");
+  }
+  return createHmac("sha256", Buffer.from(key, "hex"))
+    .update("openclaw-frontier-prompt-cache-key-v1\0")
+    .update(runNonce, "utf8")
     .digest("hex");
 }
 

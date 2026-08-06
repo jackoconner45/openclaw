@@ -73,6 +73,7 @@ export type FrontierEvidenceSnapshot = {
   policySha256: string;
   authBindingId: string;
   credentialState: "frozen_in_memory";
+  promptCacheKeyDigest: string;
   valid: boolean;
   logicalCalls: number;
   requestObservations: number;
@@ -295,6 +296,11 @@ export function createFrontierEvidenceBinding(
         policySha256: policy.policySha256,
         authBindingId: policy.authBindingId,
         credentialState: policy.credentialState,
+        promptCacheKeyDigest: computeFrontierEvidenceDigest(
+          policy.contentDigestKey,
+          "prompt-cache-key",
+          runtime.promptCacheKey,
+        ),
         valid: valid && !missingTerminalObservation,
         logicalCalls: logicalCallOrdinal,
         requestObservations,

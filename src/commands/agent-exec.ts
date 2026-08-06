@@ -45,6 +45,7 @@ export type AgentExecCliOptions = {
   authEnvOnly?: boolean;
   frontierEvidencePolicy?: string;
   frontierEvidencePolicySha256?: string;
+  frontierEvidenceRunNonce?: string;
   timeout?: string;
   json?: boolean;
 };
@@ -527,6 +528,7 @@ export async function agentExecCommand(
         {
           message: prompt,
           sessionId,
+          promptCacheKey: frontierEvidence?.promptCacheKey,
           workspaceDir: cwd,
           cwd,
           model: opts.model,

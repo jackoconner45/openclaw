@@ -161,6 +161,12 @@ ${theme.muted("Docs:")} ${formatDocsLink("/cli/agent", "docs.openclaw.ai/cli/age
         "Internal frontier evidence policy digest",
       ).hideHelp(),
     )
+    .addOption(
+      new Option(
+        "--frontier-evidence-run-nonce <hex>",
+        "Internal frontier evidence run nonce",
+      ).hideHelp(),
+    )
     .option("--timeout <seconds>", "Agent deadline in seconds", "600")
     .option("--json", "Emit the stable agent-exec JSON envelope", false)
     .addHelpText(

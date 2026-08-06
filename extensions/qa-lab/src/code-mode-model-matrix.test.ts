@@ -12,7 +12,6 @@ import {
   reserveCodeModeMatrixOutputDir,
   resolveCodeModeMatrixOutputDir,
   runCodeModeModelMatrix,
-  validateQaEvidenceSummaryJson,
   type CodeModeMatrixCellResult,
 } from "../../../scripts/code-mode-model-matrix.ts";
 
@@ -88,6 +87,18 @@ describe("Code Mode model matrix options", () => {
       parseCodeModeMatrixOptions(["--model", "openai/gpt-5.4", "--config", "matrix.json5"], "/repo")
         .config,
     ).toBe(path.resolve("/repo", "matrix.json5"));
+  });
+
+  it("keeps the real model selector when conversation proof is enabled", () => {
+    expect(
+      parseCodeModeMatrixOptions(["--model", "openai/gpt-5.4", "--conversation-proof"], "/repo"),
+    ).toMatchObject({
+      conversationProof: true,
+      models: ["openai/gpt-5.4"],
+    });
+    expect(() => parseCodeModeMatrixOptions(["--conversation-proof"], "/repo")).toThrow(
+      "Exactly one --model",
+    );
   });
 
   it("reserves a fresh output path without symlink traversal", async () => {
@@ -185,6 +196,20 @@ describe("Code Mode model matrix identity", () => {
       expect(new Set(fixtures.map((fixture) => fixture.fixtureSha256)).size).toBe(1);
       expect(new Set(fixtures.map((fixture) => fixture.promptSha256)).size).toBe(1);
       expect(new Set(fixtures.map((fixture) => fixture.expected)).size).toBe(1);
+      expect(new Set(fixtures.map((fixture) => fixture.workspaceSeedSha256)).size).toBe(1);
+      expect(new Set(fixtures.map((fixture) => fixture.workspaceIdentitySha256)).size).toBe(4);
+
+      const repeatedWorkspace = path.join(root, "repeated");
+      const first = await prepareCodeModeMatrixTaskFixture(repeatedWorkspace, cells[0]!);
+      await fs.mkdir(path.join(repeatedWorkspace, "poison"), { recursive: true });
+      await fs.writeFile(path.join(repeatedWorkspace, "result.txt"), "stale", "utf8");
+      await fs.writeFile(path.join(repeatedWorkspace, "poison", "nested.txt"), "stale", "utf8");
+      const second = await prepareCodeModeMatrixTaskFixture(repeatedWorkspace, cells[0]!);
+      expect(second).toMatchObject({
+        workspaceIdentitySha256: first.workspaceIdentitySha256,
+        workspaceSeedSha256: first.workspaceSeedSha256,
+      });
+      expect(await fs.readdir(repeatedWorkspace)).toEqual(["facts.txt"]);
     } finally {
       await fs.rm(root, { force: true, recursive: true });
     }
@@ -247,6 +272,94 @@ describe("Code Mode model matrix classification", () => {
         task: "read",
       }).failureCategory,
     ).toBe("provider_billing");
+  });
+
+  it.each([
+    "The selected model was not found by the provider. Check the model id or choose a different model.",
+    'HTTP 404: {"code":"model_not_found"}',
+    "HTTP 400: model-unavailable",
+    "HTTP 404: model gpt-5.4 not found",
+    "HTTP 400: requested model is unavailable",
+    "HTTP 404: you do not have access to the requested model",
+  ])("classifies terminal model-access errors: %s", (message) => {
+    expect(
+      classifyCodeModeMatrixCell({
+        diagnostics: "",
+        effectPassed: false,
+        envelope: {
+          ...successEnvelope,
+          ok: false,
+          status: "error",
+          final: "",
+          error: { kind: "error_payload", message },
+        },
+        expected: "CM-EXPECTED",
+        mode: "code",
+        model: "openai/gpt-5.4",
+        task: "read",
+      }).failureCategory,
+    ).toBe("provider_model_access");
+  });
+
+  it.each([
+    ["raw status only", "HTTP 404", "", "agent_error"],
+    ["diagnostics only", "run failed", "HTTP 404: requested model is unavailable", "agent_error"],
+    ["generic fixture miss", "HTTP 404: model output fixture not found", "", "agent_error"],
+    ["documentation path", "HTTP 404: docs/model-card/gpt-5.4 not found", "", "agent_error"],
+    ["wrong status", "HTTP 500: requested model is unavailable", "", "provider_transport"],
+    ["different model", "HTTP 404: other-model not found", "", "agent_error"],
+    [
+      "unrelated property miss",
+      "HTTP 400 request for model gpt-5.4: tool property not found",
+      "",
+      "agent_error",
+    ],
+    [
+      "unrelated service availability",
+      "HTTP 404 request for model gpt-5.4: tool service unavailable",
+      "",
+      "agent_error",
+    ],
+  ])(
+    "does not infer model access from %s",
+    (_name, message, diagnostics, expectedFailureCategory) => {
+      expect(
+        classifyCodeModeMatrixCell({
+          diagnostics,
+          effectPassed: false,
+          envelope: {
+            ...successEnvelope,
+            ok: false,
+            status: "error",
+            final: "",
+            error: { kind: "agent_error", message },
+          },
+          expected: "CM-EXPECTED",
+          mode: "code",
+          model: "openai/gpt-5.4",
+          task: "read",
+        }).failureCategory,
+      ).toBe(expectedFailureCategory);
+    },
+  );
+
+  it("does not infer model access from successful task output", () => {
+    expect(
+      classifyCodeModeMatrixCell({
+        diagnostics: "",
+        effectPassed: true,
+        envelope: {
+          ...successEnvelope,
+          final: "HTTP 404: requested model is unavailable",
+          model: "gpt-5.4",
+          provider: "openai",
+        },
+        expected: "HTTP 404: requested model is unavailable",
+        mode: "code",
+        model: "openai/gpt-5.4",
+        task: "read",
+      }).failureCategory,
+    ).toBeNull();
   });
 
   it("does not fail a successful run because diagnostics mention a recovered provider error", () => {
@@ -457,7 +570,7 @@ describe("Code Mode model matrix artifacts", () => {
 
       expect(result.exitCode).toBe(1);
       expect(result.summary).toMatchObject({
-        schemaVersion: 2,
+        schemaVersion: 3,
         status: "blocked",
         cellsExecuted: 0,
         blockedReasons: ["provider_route_override_present"],
@@ -510,7 +623,7 @@ describe("Code Mode model matrix artifacts", () => {
       );
       expect(result.exitCode).toBe(1);
       expect(result.summary).toMatchObject({
-        schemaVersion: 2,
+        schemaVersion: 3,
         status: "blocked",
         cellsExecuted: 0,
         blockedReasons: ["config_include_present"],
@@ -699,12 +812,13 @@ describe("Code Mode model matrix artifacts", () => {
     },
   );
 
-  it("continues after cell crashes and scores every repetition without eventual masking", async () => {
+  it("stops after the first harness failure because no auditable trace exists", async () => {
     const repoRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-code-mode-matrix-test-"));
     try {
       const configPath = path.join(repoRoot, "matrix.json5");
       await fs.writeFile(configPath, frozenConfig, "utf8");
       let calls = 0;
+      let buildReads = 0;
       const result = await runCodeModeModelMatrix(
         {
           allowFailures: false,
@@ -724,8 +838,11 @@ describe("Code Mode model matrix artifacts", () => {
           buildCliArtifacts: async () => {},
           now: () => new Date("2026-07-28T12:00:00Z"),
           readBuildSha256: async () => {
-            const entries = await fs.readdir(path.join(repoRoot, "artifacts"));
-            expect(entries).toEqual(["results.jsonl"]);
+            buildReads += 1;
+            if (buildReads === 1) {
+              const entries = await fs.readdir(path.join(repoRoot, "artifacts"));
+              expect(entries).toEqual(["results.jsonl"]);
+            }
             return "build123";
           },
           readSourceIdentity: async () => ({
@@ -736,106 +853,30 @@ describe("Code Mode model matrix artifacts", () => {
           readAuthProfile: matrixAuthProfile,
           runCell: async ({ buildSha256, cell, configSha256, gitSha }) => {
             calls += 1;
-            if (calls === 1) {
-              throw new Error("fixture exploded");
-            }
-            const fixture = await prepareCodeModeMatrixTaskFixture(
-              path.join(repoRoot, `fixture-${cell.repetition}`),
-              cell,
-            );
-            return {
-              buildSha256,
-              bridgeCalls: { search: 0, describe: 0, call: 1 },
-              codeModeEngaged: true,
-              configSha256,
-              elapsedMs: 10,
-              expected: fixture.expected,
-              failureCategory: null,
-              final: fixture.expected,
-              fixtureSha256: fixture.fixtureSha256,
-              gitSha,
-              id: cell.id,
-              mode: cell.mode,
-              model: cell.model,
-              observedModel: "gpt-5.4",
-              observedProvider: "openai",
-              oracle: {
-                answer: true,
-                effect: true,
-                engagement: true,
-                identity: true,
-                toolExecution: true,
-              },
-              passed: true,
-              promptSha256: fixture.promptSha256,
-              repetition: cell.repetition,
-              sourceDirty: false,
-              sourcePatchSha256: null,
-              status: "ok",
-              task: cell.task,
-              timestamp: "2026-07-28T12:00:00.000Z",
-              toolSummary: { calls: 1, tools: ["exec"] },
-            } satisfies CodeModeMatrixCellResult;
+            void buildSha256;
+            void cell;
+            void configSha256;
+            void gitSha;
+            throw new Error("fixture exploded");
           },
         },
       );
 
-      expect(calls).toBe(4);
+      expect(calls).toBe(1);
       expect(result.exitCode).toBe(1);
       const summary = JSON.parse(
         await fs.readFile(path.join(repoRoot, "artifacts", "summary.json"), "utf8"),
       ) as {
         counts: { total: number; passed: number; failed: number };
-        groupCounts: { total: number; firstPassPassed: number; eventualPassed: number };
-        groups: Array<{ firstPassPassed: boolean; eventualPassed: boolean }>;
       };
-      expect(summary.counts).toEqual({ total: 4, passed: 3, failed: 1 });
-      expect(summary.groupCounts).toEqual({
-        total: 2,
-        firstPassPassed: 1,
-        eventualPassed: 2,
-      });
-      expect(summary.groups).toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({ firstPassPassed: false, eventualPassed: true }),
-          expect.objectContaining({ firstPassPassed: true, eventualPassed: true }),
-        ]),
-      );
+      expect(summary.counts).toEqual({ total: 1, passed: 0, failed: 1 });
       const lines = (await fs.readFile(path.join(repoRoot, "artifacts", "results.jsonl"), "utf8"))
         .trim()
         .split("\n");
-      expect(lines).toHaveLength(4);
+      expect(lines).toHaveLength(1);
       expect(JSON.parse(lines[0] ?? "{}")).toMatchObject({
-        failureCategory: "harness_error",
-        error: { kind: "harness_error", message: "fixture exploded" },
-      });
-      const evidence = validateQaEvidenceSummaryJson(
-        JSON.parse(await fs.readFile(path.join(repoRoot, "artifacts", "qa-evidence.json"), "utf8")),
-      );
-      expect(evidence.entries).toHaveLength(4);
-      expect(evidence.entries[0]).toMatchObject({
-        test: {
-          kind: "script-test",
-          source: { path: "scripts/code-mode-model-matrix.ts" },
-        },
-        execution: {
-          provider: {
-            id: "openai",
-            model: { name: "gpt-5.4", ref: "openai/gpt-5.4" },
-          },
-          artifacts: [
-            { kind: "manifest", path: "manifest.json" },
-            { kind: "summary", path: "summary.json" },
-            { kind: "results", path: "results.jsonl" },
-          ],
-        },
-        result: {
-          status: "fail",
-          failure: { class: "harness_error", reason: "harness_error" },
-        },
-      });
-      expect(evidence.entries[1]).toMatchObject({
-        result: { status: "pass", timing: { wallMs: 10 } },
+        failureCategory: "proof_drift",
+        error: { kind: "frontier_receipt_missing_or_invalid" },
       });
     } finally {
       await fs.rm(repoRoot, { force: true, recursive: true });
@@ -890,6 +931,7 @@ describe("Code Mode model matrix artifacts", () => {
             );
             return {
               buildSha256,
+              firstLogicalCallCacheStatus: "unknown",
               codeModeEngaged: cell.mode === "code",
               configSha256,
               elapsedMs: 10,

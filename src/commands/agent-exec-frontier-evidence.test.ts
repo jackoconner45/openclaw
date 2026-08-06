@@ -5,10 +5,12 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ensureAuthProfileStore } from "../agents/auth-profiles.js";
 import {
+  deriveFrontierEvidencePromptCacheKey,
   getFrontierEvidenceExpectedAuthProfileId,
   getFrontierEvidencePolicy,
 } from "../agents/frontier-evidence-policy.js";
 import type { RuntimeEnv } from "../runtime.js";
+import { resolveFrontierEvidenceExecution } from "./agent-exec-frontier-evidence.js";
 import { agentExecCommand } from "./agent-exec.js";
 
 const tempRoots: string[] = [];
@@ -143,6 +145,7 @@ describe("agent exec frontier evidence admission", () => {
     let observedCredential: unknown;
     let observedExpectedProfileId: string | undefined;
     let observedPolicySha256: string | undefined;
+    let observedPromptCacheKey: unknown;
     try {
       const result = await agentExecCommand(
         "inspect",
@@ -150,15 +153,17 @@ describe("agent exec frontier evidence admission", () => {
           config: fixture.configPath,
           frontierEvidencePolicy: fixture.policyPath,
           frontierEvidencePolicySha256: fixture.policySha256,
+          frontierEvidenceRunNonce: "1".repeat(64),
           thinking: "high",
         },
         createRuntime(),
         {
-          runAgent: vi.fn(async () => {
+          runAgent: vi.fn(async (opts) => {
             process.env[credentialEnvName] = "sk-mutated-after-admission";
             observedCredential = ensureAuthProfileStore().profiles["openai:matrix"];
             observedExpectedProfileId = getFrontierEvidenceExpectedAuthProfileId();
             observedPolicySha256 = getFrontierEvidencePolicy()?.policySha256;
+            observedPromptCacheKey = opts.promptCacheKey;
             return successResult();
           }),
         },
@@ -179,8 +184,44 @@ describe("agent exec frontier evidence admission", () => {
     });
     expect(observedExpectedProfileId).toBe("openai:matrix");
     expect(observedPolicySha256).toBe(fixture.policySha256);
+    expect(observedPromptCacheKey).toBe(
+      deriveFrontierEvidencePromptCacheKey("d".repeat(64), "1".repeat(64)),
+    );
     expect(getFrontierEvidencePolicy()).toBeUndefined();
     expect(getFrontierEvidenceExpectedAuthProfileId()).toBeUndefined();
+  });
+
+  it("rejects missing, orphaned, or malformed run nonces before policy admission", async () => {
+    await expect(
+      resolveFrontierEvidenceExecution({
+        baseConfig: {},
+        opts: { frontierEvidenceRunNonce: "1".repeat(64) },
+      }),
+    ).rejects.toThrow("run nonce requires a frontier evidence policy");
+    await expect(
+      resolveFrontierEvidenceExecution({
+        baseConfig: {},
+        opts: {
+          config: "config.json5",
+          frontierEvidencePolicy: "policy.json",
+          frontierEvidencePolicySha256: "a".repeat(64),
+        },
+      }),
+    ).rejects.toThrow("requires a pinned config, path, SHA-256, and run nonce");
+    await expect(
+      resolveFrontierEvidenceExecution({
+        baseConfig: {},
+        opts: {
+          config: "config.json5",
+          frontierEvidencePolicy: "policy.json",
+          frontierEvidencePolicySha256: "a".repeat(64),
+          frontierEvidenceRunNonce: "ABC",
+        },
+      }),
+    ).rejects.toThrow("must be 64 lowercase hex characters");
+    expect(deriveFrontierEvidencePromptCacheKey("d".repeat(64), "1".repeat(64))).not.toBe(
+      deriveFrontierEvidencePromptCacheKey("d".repeat(64), "2".repeat(64)),
+    );
   });
 
   it("rejects a mismatched frontier policy digest before the agent runs", async () => {
@@ -199,6 +240,7 @@ describe("agent exec frontier evidence admission", () => {
           config: fixture.configPath,
           frontierEvidencePolicy: fixture.policyPath,
           frontierEvidencePolicySha256: "0".repeat(64),
+          frontierEvidenceRunNonce: "1".repeat(64),
           thinking: "high",
         },
         createRuntime(),
@@ -239,6 +281,7 @@ describe("agent exec frontier evidence admission", () => {
           config: fixture.configPath,
           frontierEvidencePolicy: fixture.policyPath,
           frontierEvidencePolicySha256: fixture.policySha256,
+          frontierEvidenceRunNonce: "1".repeat(64),
           thinking: "medium",
         },
         createRuntime(),

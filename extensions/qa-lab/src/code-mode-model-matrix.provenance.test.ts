@@ -65,6 +65,7 @@ describe("Code Mode model matrix source provenance", () => {
         ],
         { cwd: repoRoot },
       );
+      let calls = 0;
       const result = await runCodeModeModelMatrix(
         {
           allowFailures: false,
@@ -91,12 +92,14 @@ describe("Code Mode model matrix source provenance", () => {
             provider: "openai",
           }),
           runCell: async ({ buildSha256, cell, configSha256, gitSha, outputDir }) => {
+            calls += 1;
             const fixture = await prepareCodeModeMatrixTaskFixture(
               path.join(outputDir, "fixture"),
               cell,
             );
             return {
               buildSha256,
+              firstLogicalCallCacheStatus: "unknown",
               codeModeEngaged: true,
               configSha256,
               elapsedMs: 1,
@@ -130,10 +133,15 @@ describe("Code Mode model matrix source provenance", () => {
         },
       );
 
-      expect(result.exitCode).toBe(0);
-      expect(await fs.readFile(path.join(repoRoot, "qa-output", "summary.json"), "utf8")).toContain(
-        '"failed": 0',
-      );
+      expect(calls).toBe(1);
+      expect(result.exitCode).toBe(1);
+      expect(result.summary).toMatchObject({
+        counts: { total: 1, failed: 1 },
+        frontierEvidenceAudit: {
+          valid: false,
+          reasons: ["frontier_receipt_missing_or_invalid"],
+        },
+      });
     } finally {
       await fs.rm(repoRoot, { force: true, recursive: true });
     }

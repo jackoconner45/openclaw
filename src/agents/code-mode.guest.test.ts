@@ -358,7 +358,11 @@ describe("Code Mode guest execution", () => {
         channel: "discord",
         messageId: "message-1",
       },
-      telemetry: { callCount: 2 },
+      telemetry: {
+        callCount: 2,
+        attemptedToolNames: ["conversations_list", "conversations_send"],
+        attemptedToolNamesTruncated: false,
+      },
     });
     expect(exact.callGateway).toHaveBeenCalledTimes(2);
     expect(exact.callGateway.mock.calls[1]?.[0]).toMatchObject({
@@ -383,7 +387,11 @@ describe("Code Mode guest execution", () => {
           },
         ],
       },
-      telemetry: { callCount: 1 },
+      telemetry: {
+        callCount: 1,
+        attemptedToolNames: ["conversations_list"],
+        attemptedToolNamesTruncated: false,
+      },
     });
     expect(ambiguous.callGateway).toHaveBeenCalledTimes(1);
   });

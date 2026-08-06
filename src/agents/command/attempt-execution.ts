@@ -1141,6 +1141,7 @@ export function runAgentAttempt(params: {
   const embeddedRunParams: Parameters<typeof runEmbeddedAgent>[0] = {
     sessionId: params.sessionId,
     sessionKey: params.sessionKey,
+    promptCacheKey: params.opts.promptCacheKey,
     chatType: params.sessionEntry?.chatType,
     sessionTarget: params.sessionTarget,
     sandboxSessionKey: params.sessionKey,

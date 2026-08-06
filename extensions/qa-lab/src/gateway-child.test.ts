@@ -563,6 +563,25 @@ describe("buildQaRuntimeEnv", () => {
     expect(env.GEMINI_API_KEY).toBe("gemini-live");
   });
 
+  it("uses an explicit base env without inheriting ambient provider routing", () => {
+    const env = buildQaRuntimeEnv({
+      ...createParams({
+        HTTPS_PROXY: "http://ambient-proxy.invalid",
+        OPENAI_BASE_URL: "https://ambient.invalid/v1",
+      }),
+      baseEnv: {
+        OPENAI_API_KEY: "frozen-key",
+        PATH: "/frozen/bin",
+      },
+      providerMode: "live-frontier",
+    });
+
+    expect(env.OPENAI_API_KEY).toBe("frozen-key");
+    expect(env.PATH).toBe("/frozen/bin");
+    expect(env.HTTPS_PROXY).toBeUndefined();
+    expect(env.OPENAI_BASE_URL).toBeUndefined();
+  });
+
   it("defaults gateway-child provider mode to mock-openai when omitted", () => {
     expect(testing.resolveQaGatewayChildProviderMode(undefined)).toBe("mock-openai");
     expect(testing.resolveQaGatewayChildProviderMode("live-frontier")).toBe("live-frontier");
@@ -1822,6 +1841,29 @@ describe("buildQaRuntimeEnv", () => {
 
     await expectPathMissing(tempRoot);
     await expectPathMissing(stagedRoot);
+  });
+
+  it("attempts every temp-root removal before propagating cleanup failure", async () => {
+    const failure = new Error("temp root removal failed");
+    const remove = vi.fn(async (target: string) => {
+      if (target === "/tmp/qa-primary") {
+        throw failure;
+      }
+    });
+
+    await expect(
+      testing.cleanupQaGatewayTempRoots(
+        {
+          tempRoot: "/tmp/qa-primary",
+          stagedBundledPluginsRoot: "/tmp/qa-staged",
+        },
+        remove as typeof rm,
+      ),
+    ).rejects.toBe(failure);
+    expect(remove.mock.calls.map(([target]) => target)).toEqual([
+      "/tmp/qa-primary",
+      "/tmp/qa-staged",
+    ]);
   });
 });
 

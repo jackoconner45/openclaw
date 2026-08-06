@@ -117,17 +117,27 @@ The agent run-stat fields appear on `meta.agentMeta` in the `openclaw agent --js
 
 ### Code Mode model matrix
 
-From a source checkout, run the bounded evaluation matrix against any explicit model reference:
+From a source checkout, run the bounded frontier matrix against one explicit model and frozen config:
 
 ```bash
-pnpm qa:code-mode-models -- --model ollama/qwen3.5:9b
+pnpm qa:code-mode-models -- \
+  --model openai/gpt-5.4 \
+  --config ./frozen-code-mode.json5 \
+  --task dependent-read-write \
+  --repetitions 2 \
+  --thinking high \
+  --conversation-proof
 ```
 
-Repeat `--model` to compare models, or use `--mode`, `--task`, and `--repetitions` to narrow the default direct/automatic/forced Code Mode matrix. Each cell runs an isolated `agent exec` task and records model/provider identity, timing, result status, failure class, outer tool calls, Code Mode bridge calls, and verified output/effects.
+The frontier path accepts exactly one model assertion and runs matched direct/Code Mode cells in serial ABBA order. It derives cold/warm status from exact trace metrics and applies conjunctive Beta bars: accuracy must not regress, effective turns and tokens must fall, underlying calls and wall latency must not regress, and matched traces and cache status must remain auditable. A failed or unknown bar blocks a Beta recommendation.
 
-The output directory contains canonical QA Lab `qa-evidence.json`. `summary.json` and `results.jsonl` are supporting aggregate and per-cell artifacts; `manifest.json` records the requested matrix and source identity.
+`--conversation-proof` adds a required separate behavior gate with two real-model cells on one isolated QA Gateway and mock channel. Both ask for one deterministic JavaScript/TypeScript exec cell that authors the list-and-send flow; the ambiguity cell must stop before sending. A failure makes the qualification command exit nonzero, but the separate artifact is excluded from matched performance totals and does not itself establish Beta qualification.
 
-This is evaluation-only evidence, not a CI or release gate. Results do not change model capabilities, runtime routing, fallback, or repair policy.
+Run the same exact command with `--dry-run` first. It validates the frozen route and records the planned four matched cells plus two behavior cells without starting a provider or sidecar.
+
+The output directory contains canonical QA Lab `qa-evidence.json`. `summary.json` and `results.jsonl` are supporting aggregate and per-cell artifacts; `manifest.json` records the requested matrix and source identity. The optional behavior artifact is written to `conversation-proof/summary.json`.
+
+This is evaluation-only evidence, not a CI or release gate. Results do not change model capabilities, runtime routing, fallback, or repair policy. Local-model qualification remains a separate non-Beta lane and does not use the frontier behavior sidecar.
 
 ### `agent exec` options
 

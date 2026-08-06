@@ -139,4 +139,29 @@ describe("Code Mode model matrix provider setup", () => {
       }),
     ).not.toContain("--local-model-lean");
   });
+
+  it("emits the hidden run nonce only with a frozen frontier policy", () => {
+    const nonce = "a".repeat(64);
+    const args = buildCodeModeMatrixAgentExecArgs({
+      ...baseExecArgs,
+      frontierEvidencePolicy: { path: "/policy.json", sha256: "b".repeat(64) },
+      frontierEvidenceRunNonce: nonce,
+    });
+    expect(args).toEqual(
+      expect.arrayContaining([
+        "--frontier-evidence-policy",
+        "/policy.json",
+        "--frontier-evidence-policy-sha256",
+        "b".repeat(64),
+        "--frontier-evidence-run-nonce",
+        nonce,
+      ]),
+    );
+    expect(() =>
+      buildCodeModeMatrixAgentExecArgs({
+        ...baseExecArgs,
+        frontierEvidenceRunNonce: nonce,
+      }),
+    ).toThrow("requires a frontier evidence policy");
+  });
 });

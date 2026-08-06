@@ -194,6 +194,7 @@ function validReceipt(): FrontierEvidenceSnapshot {
     policySha256: "a".repeat(64),
     authBindingId: "b".repeat(32),
     credentialState: "frozen_in_memory",
+    promptCacheKeyDigest: "9".repeat(64),
     valid: true,
     logicalCalls: 2,
     requestObservations: 2,

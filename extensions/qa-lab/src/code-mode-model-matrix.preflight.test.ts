@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { runCodeModeModelMatrix } from "../../../scripts/code-mode-model-matrix.ts";
+import { validFrontierCellResult } from "./code-mode-model-matrix.test-helpers.js";
 
 const profileId = "openai:matrix";
 const credentialEnvName = "OPENAI_API_KEY";
@@ -198,6 +199,7 @@ describe("Code Mode frontier matrix preflight", () => {
   it("reuses the admitted credential value for every cell and removes the policy file", async () => {
     const repoRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-matrix-frozen-env-"));
     let authReads = 0;
+    let clock = 0;
     let policyPath: string | undefined;
     let policyText: string | undefined;
     const observedCredentials: Array<string | undefined> = [];
@@ -221,6 +223,10 @@ describe("Code Mode frontier matrix preflight", () => {
         },
         {
           buildCliArtifacts: async () => {},
+          nowMs: () => {
+            clock += 10;
+            return clock;
+          },
           readAuthProfile: async () => {
             authReads += 1;
             return {
@@ -233,11 +239,11 @@ describe("Code Mode frontier matrix preflight", () => {
           },
           readBuildSha256: async () => "build123",
           readSourceIdentity: sourceIdentity,
-          runCell: async ({ frozenEnv, frontierEvidencePolicy }) => {
-            observedCredentials.push(frozenEnv[credentialEnvName]);
-            policyPath = frontierEvidencePolicy?.path;
+          runCell: async (params) => {
+            observedCredentials.push(params.frozenEnv[credentialEnvName]);
+            policyPath = params.frontierEvidencePolicy?.path;
             policyText = policyPath ? await fs.readFile(policyPath, "utf8") : undefined;
-            throw new Error("fixture stopped after policy inspection");
+            return await validFrontierCellResult(params);
           },
         },
       );

@@ -25,6 +25,10 @@ import { resolveDefaultAgentDir, resolveDefaultAgentId } from "../src/agents/age
 import { resolveAgentEffectiveModelPrimary } from "../src/agents/agent-scope.js";
 import { ensureAuthProfileStoreWithoutExternalProfiles } from "../src/agents/auth-profiles.js";
 import type { ApiKeyCredential } from "../src/agents/auth-profiles.js";
+import {
+  computeFrontierEvidenceDigest,
+  deriveFrontierEvidencePromptCacheKey,
+} from "../src/agents/frontier-evidence-policy.js";
 import { hasAuthoredProviderRequestParams } from "../src/agents/model-extra-params.js";
 import { isLocalProviderBaseUrl } from "../src/agents/model-provider-local.js";
 import { splitTrailingAuthProfile } from "../src/agents/model-ref-profile.js";
@@ -35,13 +39,14 @@ import { createConfigIO } from "../src/config/io.js";
 import type { OpenClawConfig } from "../src/config/types.openclaw.js";
 import { isSecretRef, isValidEnvSecretRefId } from "../src/config/types.secrets.js";
 import { isValidSecretRef } from "../src/secrets/ref-contract.js";
+import { runCodeModeMatrixConversationProof } from "./lib/code-mode-model-matrix-conversation-proof.js";
 import { previewForDevToolLog, redactJsonValueForDevToolLog } from "./lib/dev-tooling-safety.ts";
 
 export { validateQaEvidenceSummaryJson };
 
 const execFileAsync = promisify(execFile);
 const SOURCE_PATH = "scripts/code-mode-model-matrix.ts";
-const MATRIX_SCHEMA_VERSION = 2;
+const MATRIX_SCHEMA_VERSION = 3;
 const DEFAULT_REPETITIONS = 2;
 const DEFAULT_TIMEOUT_SECONDS = 180;
 const MAX_REPETITIONS = 10;
@@ -52,6 +57,7 @@ export type CodeModeMatrixTask = "read" | "dependent-read-write";
 
 export type CodeModeMatrixOptions = {
   allowFailures: boolean;
+  conversationProof?: boolean;
   dryRun: boolean;
   keepState: boolean;
   models: string[];
@@ -79,6 +85,16 @@ type MatrixTaskFixture = {
   prompt: string;
   promptSha256: string;
   resultPath?: string;
+  workspaceIdentitySha256: string;
+  workspaceSeedSha256: string;
+};
+
+type MatrixConversationProofSummary = {
+  blockedReasons?: string[];
+  cells?: unknown[];
+  counts?: { failed: number; passed: number; total: number };
+  observedStatus?: "blocked" | "fail" | "pass";
+  status: "blocked" | "fail" | "pass";
 };
 
 type MatrixRuntimeEntrypoint = {
@@ -96,6 +112,7 @@ type CellFailureCategory =
   | "proof_drift"
   | "provider_auth"
   | "provider_billing"
+  | "provider_model_access"
   | "provider_transport"
   | "timeout"
   | "tool_execution";
@@ -105,10 +122,12 @@ export type CodeModeMatrixCellResult = {
   bridgeCalls?: AgentExecEnvelope["bridgeCalls"];
   buildSha256: string;
   codeModeEngaged: boolean | null;
+  firstLogicalCallCacheStatus: MatrixCacheStatus;
   configSha256: string | null;
   costUsd?: number;
   diagnostics?: string;
   elapsedMs: number;
+  wallLatencyMs?: number;
   error?: AgentExecEnvelope["error"];
   expected: string;
   failureCategory: CellFailureCategory | null;
@@ -137,11 +156,18 @@ export type CodeModeMatrixCellResult = {
   task: CodeModeMatrixTask;
   timestamp: string;
   toolSummary?: AgentExecEnvelope["toolSummary"];
+  trace?: AgentExecEnvelope["trace"];
   usage?: AgentExecEnvelope["usage"];
+  workspaceIdentitySha256?: string;
+  workspaceSeedSha256?: string;
 };
+
+export type MatrixCacheStatus = "cold" | "warm" | "unknown";
+type BetaGateBar = "pass" | "fail" | "unknown";
 
 type RunCellParams = {
   buildSha256: string;
+  campaignRoot: string;
   cell: MatrixCell;
   config?: unknown;
   configPath?: string;
@@ -156,6 +182,7 @@ type RunCellParams = {
     path: string;
     sha256: string;
   };
+  frontierEvidenceRunNonce: string;
   sourceDirty: boolean;
   sourcePatchSha256: string | null;
   thinking: string;
@@ -165,8 +192,10 @@ type RunCellParams = {
 type MatrixRunDependencies = {
   buildCliArtifacts?: (repoRoot: string) => Promise<void>;
   now?: () => Date;
+  nowMs?: () => number;
   readBuildSha256?: (repoRoot: string) => Promise<string>;
   readGitSha?: (repoRoot: string) => Promise<string>;
+  readPolicySha256?: (policyPath: string) => Promise<string>;
   readSourceIdentity?: (repoRoot: string) => Promise<SourceIdentity>;
   readAuthProfile?: (params: {
     config: unknown;
@@ -174,6 +203,9 @@ type MatrixRunDependencies = {
     provider: string;
   }) => Promise<MatrixAuthProfileObservation>;
   runCell?: (params: RunCellParams) => Promise<CodeModeMatrixCellResult>;
+  runConversationProof?: (
+    params: Parameters<typeof runCodeModeMatrixConversationProof>[0],
+  ) => Promise<MatrixConversationProofSummary>;
 };
 
 type SourceIdentity = {
@@ -181,6 +213,48 @@ type SourceIdentity = {
   sourceDirty: boolean;
   sourcePatchSha256: string | null;
 };
+
+async function auditFrozenMatrixIdentity(params: {
+  expected: {
+    buildSha256: string;
+    configSha256: string | null;
+    policySha256: string;
+    source: SourceIdentity;
+  };
+  readBuildSha256: () => Promise<string>;
+  readConfigSha256: () => Promise<string | null>;
+  readPolicySha256: () => Promise<string>;
+  readSourceIdentity: () => Promise<SourceIdentity>;
+}): Promise<string[]> {
+  const reasons = new Set<string>();
+  const [source, config, build, policy] = await Promise.allSettled([
+    params.readSourceIdentity(),
+    params.readConfigSha256(),
+    params.readBuildSha256(),
+    params.readPolicySha256(),
+  ]);
+  if (
+    source.status === "fulfilled" &&
+    (source.value.gitSha !== params.expected.source.gitSha ||
+      source.value.sourceDirty !== params.expected.source.sourceDirty ||
+      source.value.sourcePatchSha256 !== params.expected.source.sourcePatchSha256)
+  ) {
+    reasons.add("source_mismatch");
+  }
+  if (config.status === "fulfilled" && config.value !== params.expected.configSha256) {
+    reasons.add("config_mismatch");
+  }
+  if (build.status === "fulfilled" && build.value !== params.expected.buildSha256) {
+    reasons.add("build_mismatch");
+  }
+  if (policy.status === "fulfilled" && policy.value !== params.expected.policySha256) {
+    reasons.add("policy_mismatch");
+  }
+  if ([source, config, build, policy].some((result) => result.status === "rejected")) {
+    reasons.add("identity_recheck_failed");
+  }
+  return [...reasons].toSorted();
+}
 
 type PinnedConfigSnapshot = {
   effective: OpenClawConfig | undefined;
@@ -261,6 +335,7 @@ Options:
   --keep-state              Retain per-cell state and workspace directories
   --allow-failures          Exit zero after writing evidence even when cells fail
   --dry-run                 Write the manifest without calling models
+  --conversation-proof      Run two real OpenAI model cells on an isolated QA Gateway/channel
   -h, --help                Show this help
 
 The frozen config selects one model@profile. Credential values are never written to artifacts.
@@ -316,6 +391,7 @@ export function parseCodeModeMatrixOptions(
   const modes: CodeModeMatrixMode[] = [];
   const tasks: CodeModeMatrixTask[] = [];
   let allowFailures = false;
+  let conversationProof = false;
   let dryRun = false;
   let keepState = false;
   let config: string | undefined;
@@ -399,6 +475,11 @@ export function parseCodeModeMatrixOptions(
       dryRun = true;
       continue;
     }
+    if (arg === "--conversation-proof") {
+      recordOnce(arg);
+      conversationProof = true;
+      continue;
+    }
     if (arg === "--help" || arg === "-h") {
       throw Object.assign(new Error(usage()), { code: "HELP" });
     }
@@ -411,6 +492,7 @@ export function parseCodeModeMatrixOptions(
   return {
     allowFailures,
     config,
+    conversationProof,
     dryRun,
     keepState,
     models,
@@ -704,22 +786,68 @@ function taskPrompt(task: CodeModeMatrixTask): string {
     : "Read facts.txt using tools. Write only its verification_code value to result.txt, then read result.txt and reply with only that value. Do not guess or skip verification.";
 }
 
+function workspaceIdentitySha256(cell: MatrixCell): string {
+  return createHash("sha256")
+    .update("openclaw-code-mode-workspace-v1\0")
+    .update(cell.id)
+    .digest("hex");
+}
+
+function workspaceSeedSha256(entries: ReadonlyArray<readonly [string, Buffer]>): string {
+  const hash = createHash("sha256").update("openclaw-code-mode-workspace-seed-v1\0");
+  for (const [relativePath, contents] of entries.toSorted(([left], [right]) =>
+    left.localeCompare(right),
+  )) {
+    hash.update(relativePath).update("\0");
+    hash.update(String(contents.byteLength)).update("\0");
+    hash.update(contents);
+  }
+  return hash.digest("hex");
+}
+
+async function readWorkspaceSeedSha256(workspace: string): Promise<string> {
+  const entries: Array<readonly [string, Buffer]> = [];
+  const visit = async (directory: string): Promise<void> => {
+    const children = (await fs.readdir(directory, { withFileTypes: true })).toSorted((a, b) =>
+      a.name.localeCompare(b.name),
+    );
+    for (const child of children) {
+      const childPath = path.join(directory, child.name);
+      const relativePath = path.relative(workspace, childPath).split(path.sep).join("/");
+      if (child.isDirectory()) {
+        await visit(childPath);
+      } else if (child.isFile()) {
+        entries.push([relativePath, await fs.readFile(childPath)]);
+      } else {
+        throw new Error(`unsupported workspace seed entry: ${relativePath}`);
+      }
+    }
+  };
+  await visit(workspace);
+  return workspaceSeedSha256(entries);
+}
+
 export async function prepareCodeModeMatrixTaskFixture(
   workspace: string,
   cell: MatrixCell,
 ): Promise<MatrixTaskFixture> {
   const expected = verificationCode(cell);
   const facts = taskFixtureText(cell);
+  await fs.rm(workspace, { force: true, recursive: true });
   await fs.mkdir(workspace, { recursive: true });
   await fs.writeFile(path.join(workspace, "facts.txt"), facts, "utf8");
   const fixtureSha256 = createHash("sha256").update(facts).digest("hex");
   const prompt = taskPrompt(cell.task);
+  const workspaceIdentity = workspaceIdentitySha256(cell);
+  const workspaceSeed = await readWorkspaceSeedSha256(workspace);
   if (cell.task === "read") {
     return {
       expected,
       fixtureSha256,
       prompt,
       promptSha256: createHash("sha256").update(prompt).digest("hex"),
+      workspaceIdentitySha256: workspaceIdentity,
+      workspaceSeedSha256: workspaceSeed,
     };
   }
   const resultPath = path.join(workspace, "result.txt");
@@ -730,6 +858,8 @@ export async function prepareCodeModeMatrixTaskFixture(
     prompt,
     promptSha256: createHash("sha256").update(prompt).digest("hex"),
     resultPath,
+    workspaceIdentitySha256: workspaceIdentity,
+    workspaceSeedSha256: workspaceSeed,
   };
 }
 
@@ -935,6 +1065,21 @@ const MATRIX_BLOCKED_ROUTE_ENV_NAMES = [
 
 function sha256Domain(label: string, value: string): string {
   return createHash("sha256").update(`${label}\0${value}`).digest("hex");
+}
+
+function matrixCellRunNonce(contentDigestKey: string, cellId: string): string {
+  return createHmac("sha256", Buffer.from(contentDigestKey, "hex"))
+    .update("openclaw-code-mode-matrix-cell-nonce-v1\0")
+    .update(cellId, "utf8")
+    .digest("hex");
+}
+
+function promptCacheKeyDigest(contentDigestKey: string, runNonce: string): string {
+  return computeFrontierEvidenceDigest(
+    contentDigestKey,
+    "prompt-cache-key",
+    deriveFrontierEvidencePromptCacheKey(contentDigestKey, runNonce),
+  );
 }
 
 function buildFrozenOperationalEnv(baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
@@ -1444,7 +1589,47 @@ function expectedEngagement(mode: CodeModeMatrixMode, engaged: boolean | undefin
   return engaged === (mode === "code");
 }
 
-function classifyProviderFailure(text: string): CellFailureCategory | null {
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+}
+
+function isProviderModelAccessFailure(text: string, requestedModel: string): boolean {
+  // embedded-agent-helpers intentionally removes provider status/detail from
+  // model-not-found errors before the terminal envelope reaches this runner.
+  if (
+    text
+      .trimStart()
+      .startsWith(
+        "The selected model was not found by the provider. Check the model id or choose a different model.",
+      )
+  ) {
+    return true;
+  }
+  if (!/\b(?:400|404)\b/u.test(text)) {
+    return false;
+  }
+  if (/\bmodel(?:_|-)(?:not(?:_|-)found|unavailable)\b/iu.test(text)) {
+    return true;
+  }
+
+  const requestedModelSlug = requestedModel.trim();
+  const exactModelRef = requestedModelSlug
+    ? `(?:model\\s+)?["'\`]?${escapeRegExp(requestedModelSlug)}["'\`]?`
+    : "(?!)";
+  const qualifiedModelRef = "(?:(?:requested|specified|selected)\\s+model)";
+  const modelRef = `(?:${qualifiedModelRef}|${exactModelRef})`;
+  const modelFailure = new RegExp(
+    `(?:^|[\\s:,(])${modelRef}\\s+(?:(?:is|was)\\s+)?(?:unavailable|not found|does not exist)\\b`,
+    "iu",
+  );
+  const modelNoAccess = new RegExp(
+    `\\b(?:(?:do(?:es)? not|doesn't|don't) have access|no access)\\s+to\\s+(?:the\\s+)?${modelRef}(?:$|[\\s.,;)])`,
+    "iu",
+  );
+  return modelFailure.test(text) || modelNoAccess.test(text);
+}
+
+function classifyProviderFailure(text: string, requestedModel: string): CellFailureCategory | null {
   if (
     /\b402\b|billing|credits? (?:depleted|exhausted|insufficient)|payment required/iu.test(text)
   ) {
@@ -1452,6 +1637,9 @@ function classifyProviderFailure(text: string): CellFailureCategory | null {
   }
   if (/\b401\b|\b403\b|unauthorized|forbidden|invalid (?:api )?key|authentication/iu.test(text)) {
     return "provider_auth";
+  }
+  if (isProviderModelAccessFailure(text, requestedModel)) {
+    return "provider_model_access";
   }
   if (
     /connection refused|connect timeout|fetch failed|network|socket|stream.*(?:closed|ended)|http 5\d\d/iu.test(
@@ -1499,7 +1687,8 @@ export function classifyCodeModeMatrixCell(params: {
   }
   if (!params.envelope.ok) {
     const providerFailure = classifyProviderFailure(
-      `${params.envelope.error?.message ?? ""}\n${params.diagnostics}`,
+      params.envelope.error?.message ?? "",
+      requestedModel,
     );
     if (providerFailure) {
       return { failureCategory: providerFailure, oracle, passed: false };
@@ -1691,12 +1880,22 @@ export function buildCodeModeMatrixAgentExecArgs(params: {
     path: string;
     sha256: string;
   };
+  frontierEvidenceRunNonce?: string;
   fixture: Pick<MatrixTaskFixture, "prompt">;
   matrix: Pick<RunCellParams, "cell" | "config" | "thinking" | "timeoutSeconds">;
   runtime: MatrixRuntimeEntrypoint;
   stateDir: string;
   workspace: string;
 }): string[] {
+  if (!params.frontierEvidencePolicy && params.frontierEvidenceRunNonce) {
+    throw new Error("frontier evidence run nonce requires a frontier evidence policy");
+  }
+  if (
+    params.frontierEvidencePolicy &&
+    !/^[a-f0-9]{64}$/u.test(params.frontierEvidenceRunNonce ?? "")
+  ) {
+    throw new Error("frontier evidence run nonce is missing or invalid");
+  }
   return [
     ...params.runtime.args,
     "agent",
@@ -1718,6 +1917,8 @@ export function buildCodeModeMatrixAgentExecArgs(params: {
           params.frontierEvidencePolicy.path,
           "--frontier-evidence-policy-sha256",
           params.frontierEvidencePolicy.sha256,
+          "--frontier-evidence-run-nonce",
+          params.frontierEvidenceRunNonce ?? "",
         ]
       : []),
     "--thinking",
@@ -1745,6 +1946,7 @@ async function executeAgentExec(params: {
   const args = buildCodeModeMatrixAgentExecArgs({
     configPath: params.matrix.configPath,
     frontierEvidencePolicy: params.matrix.frontierEvidencePolicy,
+    frontierEvidenceRunNonce: params.matrix.frontierEvidenceRunNonce,
     fixture: params.fixture,
     matrix: params.matrix,
     runtime,
@@ -1813,13 +2015,11 @@ async function executeAgentExec(params: {
 }
 
 async function runMatrixCell(params: RunCellParams): Promise<CodeModeMatrixCellResult> {
+  const workspaceIdentity = workspaceIdentitySha256(params.cell);
+  const root = path.join(params.campaignRoot, "cells", workspaceIdentity);
   const retainedRoot = path.join(params.outputDir, "state", params.cell.id);
-  if (params.keepState) {
-    await fs.rm(retainedRoot, { force: true, recursive: true });
-  }
-  const root = params.keepState
-    ? retainedRoot
-    : await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-code-mode-matrix-"));
+  await fs.rm(root, { force: true, recursive: true });
+  await fs.rm(retainedRoot, { force: true, recursive: true });
   const stateDir = path.join(root, "state");
   const workspace = path.join(root, "workspace");
   await fs.mkdir(stateDir, { recursive: true });
@@ -1852,6 +2052,7 @@ async function runMatrixCell(params: RunCellParams): Promise<CodeModeMatrixCellR
         : {}),
       ...(command.envelope.bridgeCalls ? { bridgeCalls: command.envelope.bridgeCalls } : {}),
       buildSha256: params.buildSha256,
+      firstLogicalCallCacheStatus: classifyMatrixCacheStatus(command.envelope.trace),
       codeModeEngaged: command.envelope.codeModeEngaged ?? null,
       configSha256: params.configSha256,
       ...(command.envelope.costUsd !== undefined ? { costUsd: command.envelope.costUsd } : {}),
@@ -1881,12 +2082,17 @@ async function runMatrixCell(params: RunCellParams): Promise<CodeModeMatrixCellR
       task: params.cell.task,
       timestamp: new Date().toISOString(),
       ...(command.envelope.toolSummary ? { toolSummary: command.envelope.toolSummary } : {}),
+      ...(command.envelope.trace ? { trace: command.envelope.trace } : {}),
       ...(command.envelope.usage ? { usage: command.envelope.usage } : {}),
+      workspaceIdentitySha256: fixture.workspaceIdentitySha256,
+      workspaceSeedSha256: fixture.workspaceSeedSha256,
     };
   } finally {
-    if (!params.keepState) {
-      await fs.rm(root, { force: true, recursive: true });
+    if (params.keepState) {
+      await fs.mkdir(path.dirname(retainedRoot), { recursive: true });
+      await fs.cp(root, retainedRoot, { recursive: true });
     }
+    await fs.rm(root, { force: true, recursive: true });
   }
 }
 
@@ -1905,6 +2111,7 @@ function harnessFailureResult(
   );
   return {
     buildSha256: provenance.buildSha256,
+    firstLogicalCallCacheStatus: "unknown",
     codeModeEngaged: null,
     configSha256: provenance.configSha256,
     diagnostics: message,
@@ -1951,6 +2158,7 @@ function proofDriftResult(
 ): CodeModeMatrixCellResult {
   return {
     buildSha256: provenance.buildSha256,
+    firstLogicalCallCacheStatus: "unknown",
     codeModeEngaged: null,
     configSha256: provenance.configSha256,
     diagnostics: error.code,
@@ -1986,6 +2194,21 @@ function proofDriftResult(
   };
 }
 
+function preserveResultAsProofDrift(
+  result: CodeModeMatrixCellResult,
+  elapsedMs: number,
+  error: MatrixPreflightError,
+): CodeModeMatrixCellResult {
+  return {
+    ...result,
+    diagnostics: error.code,
+    elapsedMs,
+    error: { kind: error.code, message: error.code },
+    failureCategory: "proof_drift",
+    passed: false,
+  };
+}
+
 function summarizeResults(results: CodeModeMatrixCellResult[]) {
   const groups = new Map<
     string,
@@ -2011,7 +2234,7 @@ function summarizeResults(results: CodeModeMatrixCellResult[]) {
       wallMs: [],
     };
     group.total += 1;
-    group.wallMs.push(result.elapsedMs);
+    group.wallMs.push(result.wallLatencyMs ?? result.elapsedMs);
     if (result.passed) {
       group.passed += 1;
       if (result.repetition === 1) {
@@ -2047,14 +2270,360 @@ function summarizeResults(results: CodeModeMatrixCellResult[]) {
   });
 }
 
+export function classifyMatrixCacheStatus(
+  trace: AgentExecEnvelope["trace"] | undefined,
+): MatrixCacheStatus {
+  if (trace?.schemaVersion !== 4) {
+    return "unknown";
+  }
+  const metric = trace.metrics.tokens.firstLogicalCallCachedInput;
+  if (metric?.state !== "exact" || !Number.isFinite(metric.value) || metric.value < 0) {
+    return "unknown";
+  }
+  return metric.value === 0 ? "cold" : "warm";
+}
+
+function exactTraceMetric(
+  result: CodeModeMatrixCellResult,
+  select: (trace: NonNullable<CodeModeMatrixCellResult["trace"]>) => {
+    state: string;
+    value?: number;
+  },
+): number | null {
+  if (!result.trace) {
+    return null;
+  }
+  const metric = select(result.trace);
+  return metric.state === "exact" &&
+    typeof metric.value === "number" &&
+    Number.isFinite(metric.value) &&
+    metric.value >= 0
+    ? metric.value
+    : null;
+}
+
+function sumExactTraceMetrics(
+  results: readonly CodeModeMatrixCellResult[],
+  select: Parameters<typeof exactTraceMetric>[1],
+): number | null {
+  let total = 0;
+  for (const result of results) {
+    const value = exactTraceMetric(result, select);
+    if (value === null) {
+      return null;
+    }
+    total += value;
+  }
+  return total;
+}
+
+function sumCellMetric(
+  results: readonly CodeModeMatrixCellResult[],
+  select: (result: CodeModeMatrixCellResult) => number | undefined,
+): number | null {
+  let total = 0;
+  for (const result of results) {
+    const value = select(result);
+    if (value === undefined || !Number.isFinite(value) || value < 0) {
+      return null;
+    }
+    total += value;
+  }
+  return total;
+}
+
+function sumNullableMetrics(...values: Array<number | null>): number | null {
+  let total = 0;
+  for (const value of values) {
+    if (value === null) {
+      return null;
+    }
+    total += value;
+  }
+  return total;
+}
+
+function matchedAbbaPairs(results: readonly CodeModeMatrixCellResult[]): {
+  pairs: Array<{ direct: CodeModeMatrixCellResult; code: CodeModeMatrixCellResult }>;
+  valid: boolean;
+} {
+  const relevant = results.filter((result) => result.mode === "direct" || result.mode === "code");
+  const byTask = new Map<string, CodeModeMatrixCellResult[]>();
+  for (const result of relevant) {
+    const key = `${result.model}\0${result.task}`;
+    const taskResults = byTask.get(key) ?? [];
+    taskResults.push(result);
+    byTask.set(key, taskResults);
+  }
+  const pairs: Array<{ direct: CodeModeMatrixCellResult; code: CodeModeMatrixCellResult }> = [];
+  for (const taskResults of byTask.values()) {
+    const ordered = [...taskResults];
+    if (ordered.length === 0 || ordered.length % 4 !== 0) {
+      return { pairs: [], valid: false };
+    }
+    for (let index = 0; index < ordered.length; index += 4) {
+      const chunk = ordered.slice(index, index + 4);
+      const firstRepetition = chunk[0]?.repetition;
+      const secondRepetition = chunk[2]?.repetition;
+      if (
+        !firstRepetition ||
+        !secondRepetition ||
+        secondRepetition !== firstRepetition + 1 ||
+        chunk[0]?.mode !== "direct" ||
+        chunk[0]?.repetition !== firstRepetition ||
+        chunk[1]?.mode !== "code" ||
+        chunk[1]?.repetition !== firstRepetition ||
+        chunk[2]?.mode !== "code" ||
+        chunk[2]?.repetition !== secondRepetition ||
+        chunk[3]?.mode !== "direct" ||
+        chunk[3]?.repetition !== secondRepetition
+      ) {
+        return { pairs: [], valid: false };
+      }
+      pairs.push({ direct: chunk[0]!, code: chunk[1]! }, { direct: chunk[3]!, code: chunk[2]! });
+    }
+  }
+  return { pairs, valid: pairs.length > 0 };
+}
+
+export function buildCodeModeMatrixBetaGate(results: readonly CodeModeMatrixCellResult[]) {
+  const matching = matchedAbbaPairs(results);
+  const tracedResults = matching.pairs.flatMap((pair) => [pair.direct, pair.code]);
+  const auditableMatchedTraces: BetaGateBar =
+    matching.valid &&
+    tracedResults.every(
+      (result) =>
+        result.trace?.schemaVersion === 4 &&
+        result.trace.audit.state === "valid" &&
+        result.trace.route?.provider === result.observedProvider &&
+        result.trace.route?.model === result.observedModel,
+    )
+      ? "pass"
+      : "unknown";
+  const matchedCacheStates = tracedResults.map((result) => ({
+    recorded: result.firstLogicalCallCacheStatus,
+    observed: classifyMatrixCacheStatus(result.trace),
+  }));
+  const coldInitialPerCell: BetaGateBar = !matching.valid
+    ? "unknown"
+    : matchedCacheStates.some(
+          ({ observed, recorded }) => observed === "unknown" || recorded !== observed,
+        )
+      ? "unknown"
+      : matchedCacheStates.every(({ observed }) => observed === "cold")
+        ? "pass"
+        : "fail";
+  const comparable = auditableMatchedTraces === "pass" && coldInitialPerCell === "pass";
+  const direct = matching.pairs.map((pair) => pair.direct);
+  const code = matching.pairs.map((pair) => pair.code);
+  const comparison = (
+    left: number | null,
+    right: number | null,
+    predicate: (directValue: number, codeValue: number) => boolean,
+  ): BetaGateBar =>
+    !comparable || left === null || right === null
+      ? "unknown"
+      : predicate(left, right)
+        ? "pass"
+        : "fail";
+  const directTurns = sumExactTraceMetrics(direct, (trace) => trace.metrics.effectiveTurns);
+  const codeTurns = sumExactTraceMetrics(code, (trace) => trace.metrics.effectiveTurns);
+  const directTokens = sumExactTraceMetrics(direct, (trace) => trace.metrics.tokens.total);
+  const codeTokens = sumExactTraceMetrics(code, (trace) => trace.metrics.tokens.total);
+  const directInputTokens = sumExactTraceMetrics(direct, (trace) => trace.metrics.tokens.input);
+  const codeInputTokens = sumExactTraceMetrics(code, (trace) => trace.metrics.tokens.input);
+  const directOutputTokens = sumExactTraceMetrics(direct, (trace) => trace.metrics.tokens.output);
+  const codeOutputTokens = sumExactTraceMetrics(code, (trace) => trace.metrics.tokens.output);
+  const directCachedInputTokens = sumExactTraceMetrics(
+    direct,
+    (trace) => trace.metrics.tokens.cachedInput,
+  );
+  const codeCachedInputTokens = sumExactTraceMetrics(
+    code,
+    (trace) => trace.metrics.tokens.cachedInput,
+  );
+  const directModelCalls = sumExactTraceMetrics(direct, (trace) => trace.metrics.logicalModelCalls);
+  const codeModelCalls = sumExactTraceMetrics(code, (trace) => trace.metrics.logicalModelCalls);
+  const directProviderAttempts = sumExactTraceMetrics(
+    direct,
+    (trace) => trace.metrics.providerAttempts.total,
+  );
+  const codeProviderAttempts = sumExactTraceMetrics(
+    code,
+    (trace) => trace.metrics.providerAttempts.total,
+  );
+  const directRetries = sumExactTraceMetrics(
+    direct,
+    (trace) => trace.metrics.providerAttempts.retries,
+  );
+  const codeRetries = sumExactTraceMetrics(code, (trace) => trace.metrics.providerAttempts.retries);
+  const directAuthRecoveries = sumExactTraceMetrics(
+    direct,
+    (trace) => trace.metrics.providerAttempts.authRecoveries,
+  );
+  const codeAuthRecoveries = sumExactTraceMetrics(
+    code,
+    (trace) => trace.metrics.providerAttempts.authRecoveries,
+  );
+  const directPayloadRecoveries = sumExactTraceMetrics(
+    direct,
+    (trace) => trace.metrics.providerAttempts.payloadRecoveries,
+  );
+  const codePayloadRecoveries = sumExactTraceMetrics(
+    code,
+    (trace) => trace.metrics.providerAttempts.payloadRecoveries,
+  );
+  const directTransportFallbacks = sumExactTraceMetrics(
+    direct,
+    (trace) => trace.metrics.providerAttempts.transportFallbacks,
+  );
+  const codeTransportFallbacks = sumExactTraceMetrics(
+    code,
+    (trace) => trace.metrics.providerAttempts.transportFallbacks,
+  );
+  const directAdditionalProviderAttempts = sumNullableMetrics(
+    directRetries,
+    directAuthRecoveries,
+    directPayloadRecoveries,
+    directTransportFallbacks,
+  );
+  const codeAdditionalProviderAttempts = sumNullableMetrics(
+    codeRetries,
+    codeAuthRecoveries,
+    codePayloadRecoveries,
+    codeTransportFallbacks,
+  );
+  const directPhysicalFetchDispatch = sumExactTraceMetrics(
+    direct,
+    (trace) => trace.metrics.physicalFetchDispatch,
+  );
+  const codePhysicalFetchDispatch = sumExactTraceMetrics(
+    code,
+    (trace) => trace.metrics.physicalFetchDispatch,
+  );
+  const directOuterToolCalls = sumExactTraceMetrics(
+    direct,
+    (trace) => trace.metrics.outerToolCalls,
+  );
+  const codeOuterToolCalls = sumExactTraceMetrics(code, (trace) => trace.metrics.outerToolCalls);
+  const directToolOperations = sumExactTraceMetrics(
+    direct,
+    (trace) => trace.metrics.totalToolOperations,
+  );
+  const codeToolOperations = sumExactTraceMetrics(
+    code,
+    (trace) => trace.metrics.totalToolOperations,
+  );
+  const directCalls = sumExactTraceMetrics(direct, (trace) => trace.metrics.underlyingTotalCalls);
+  const codeCalls = sumExactTraceMetrics(code, (trace) => trace.metrics.underlyingTotalCalls);
+  const directAgentTime = sumExactTraceMetrics(direct, (trace) => trace.metrics.agentDurationMs);
+  const codeAgentTime = sumExactTraceMetrics(code, (trace) => trace.metrics.agentDurationMs);
+  const directWallLatency = sumCellMetric(direct, (result) => result.wallLatencyMs);
+  const codeWallLatency = sumCellMetric(code, (result) => result.wallLatencyMs);
+  const callRegression = comparison(directCalls, codeCalls, (a, b) => b <= a);
+  const wallLatencyRegression = comparison(directWallLatency, codeWallLatency, (a, b) => b <= a);
+  const bars = {
+    accuracyNonRegression: comparable
+      ? code.filter((result) => result.passed).length >=
+        direct.filter((result) => result.passed).length
+        ? ("pass" as const)
+        : ("fail" as const)
+      : ("unknown" as const),
+    fewerEffectiveTurns: comparison(directTurns, codeTurns, (a, b) => b < a),
+    fewerTokens: comparison(directTokens, codeTokens, (a, b) => b < a),
+    noRegressionInCallsOrWallLatency:
+      callRegression === "fail" || wallLatencyRegression === "fail"
+        ? ("fail" as const)
+        : callRegression === "pass" && wallLatencyRegression === "pass"
+          ? ("pass" as const)
+          : ("unknown" as const),
+    auditableMatchedTraces,
+    coldInitialPerCell,
+  };
+  const values = Object.values(bars);
+  return {
+    state: values.includes("fail")
+      ? ("blocked" as const)
+      : values.includes("unknown")
+        ? ("inconclusive" as const)
+        : ("diagnostic_pass" as const),
+    bars,
+    recommendation: "requires_frozen_representative_benchmark" as const,
+    matchedPairs: matching.pairs.length,
+    totals: {
+      direct: {
+        passed: direct.filter((result) => result.passed).length,
+        cells: direct.length,
+        effectiveTurns: directTurns,
+        modelFacingCalls: directModelCalls,
+        providerAttempts: directProviderAttempts,
+        retries: directRetries,
+        authRecoveries: directAuthRecoveries,
+        payloadRecoveries: directPayloadRecoveries,
+        transportFallbacks: directTransportFallbacks,
+        additionalProviderAttempts: directAdditionalProviderAttempts,
+        physicalFetchDispatch: directPhysicalFetchDispatch,
+        outerToolCalls: directOuterToolCalls,
+        totalToolOperations: directToolOperations,
+        tokens: directTokens,
+        inputTokens: directInputTokens,
+        cachedInputTokens: directCachedInputTokens,
+        outputTokens: directOutputTokens,
+        underlyingTotalCalls: directCalls,
+        agentTimeMs: directAgentTime,
+        wallLatencyMs: directWallLatency,
+      },
+      code: {
+        passed: code.filter((result) => result.passed).length,
+        cells: code.length,
+        effectiveTurns: codeTurns,
+        modelFacingCalls: codeModelCalls,
+        providerAttempts: codeProviderAttempts,
+        retries: codeRetries,
+        authRecoveries: codeAuthRecoveries,
+        payloadRecoveries: codePayloadRecoveries,
+        transportFallbacks: codeTransportFallbacks,
+        additionalProviderAttempts: codeAdditionalProviderAttempts,
+        physicalFetchDispatch: codePhysicalFetchDispatch,
+        outerToolCalls: codeOuterToolCalls,
+        totalToolOperations: codeToolOperations,
+        tokens: codeTokens,
+        inputTokens: codeInputTokens,
+        cachedInputTokens: codeCachedInputTokens,
+        outputTokens: codeOutputTokens,
+        underlyingTotalCalls: codeCalls,
+        agentTimeMs: codeAgentTime,
+        wallLatencyMs: codeWallLatency,
+      },
+    },
+  };
+}
+
+export function resolveCodeModeMatrixExitCode(params: {
+  allowFailures: boolean;
+  betaGateState: ReturnType<typeof buildCodeModeMatrixBetaGate>["state"];
+  conversationProofStatus?: "blocked" | "fail" | "pass";
+  failed: number;
+  frontierEvidenceValid: boolean;
+}): 0 | 1 {
+  return (params.failed > 0 && !params.allowFailures) ||
+    !params.frontierEvidenceValid ||
+    params.betaGateState !== "diagnostic_pass" ||
+    (params.conversationProofStatus !== undefined && params.conversationProofStatus !== "pass")
+    ? 1
+    : 0;
+}
+
 function auditFrontierEvidenceReceipts(
   results: readonly CodeModeMatrixCellResult[],
   contentDigestKey: string,
+  expectedPromptCacheKeyDigests?: ReadonlyMap<string, string>,
 ): { valid: boolean; reasons: string[] } {
   const reasons = new Set<string>();
   const taskByPair = new Map<string, string>();
   const comparableInputByMode = new Map<string, string>();
   const schemaByMode = new Map<string, string>();
+  const cellByPromptCacheKeyDigest = new Map<string, string>();
   for (const result of results) {
     const receipts = result.frontierEvidence;
     if (receipts?.length !== 1 || !receipts[0]?.valid) {
@@ -2062,6 +2631,28 @@ function auditFrontierEvidenceReceipts(
       continue;
     }
     const receipt = receipts[0];
+    const logicalCallBindingIds = receipt.callSequences.map(
+      (sequence) => sequence.logicalCallBindingId,
+    );
+    if (
+      logicalCallBindingIds.some((bindingId) => !/^[a-f0-9]{64}$/u.test(bindingId)) ||
+      new Set(logicalCallBindingIds).size !== logicalCallBindingIds.length
+    ) {
+      reasons.add("frontier_logical_call_binding_invalid");
+    }
+    if (!/^[a-f0-9]{64}$/u.test(receipt.promptCacheKeyDigest)) {
+      reasons.add("frontier_prompt_cache_key_digest_missing");
+    } else {
+      const expectedDigest = expectedPromptCacheKeyDigests?.get(result.id);
+      if (expectedDigest && receipt.promptCacheKeyDigest !== expectedDigest) {
+        reasons.add("frontier_prompt_cache_key_digest_mismatch");
+      }
+      const priorCell = cellByPromptCacheKeyDigest.get(receipt.promptCacheKeyDigest);
+      if (priorCell && priorCell !== result.id) {
+        reasons.add("frontier_prompt_cache_key_reused");
+      }
+      cellByPromptCacheKeyDigest.set(receipt.promptCacheKeyDigest, result.id);
+    }
     const requests = receipt.callSequences.flatMap((call) => call.requests);
     if (requests.length === 0) {
       reasons.add("frontier_request_digest_missing");
@@ -2114,8 +2705,10 @@ function auditFrontierEvidenceReceipts(
 
 function validateCellResultProvenance(params: {
   cell: MatrixCell;
+  contentDigestKey: string;
   expectedBuildSha256: string;
   expectedConfigSha256: string | null;
+  expectedPromptCacheKeyDigest: string;
   expectedSource: SourceIdentity;
   result: CodeModeMatrixCellResult;
 }): string[] {
@@ -2145,6 +2738,47 @@ function validateCellResultProvenance(params: {
   if (params.result.promptSha256 !== expectedPromptSha256) {
     reasons.add("prompt_mismatch");
   }
+  if (params.result.workspaceIdentitySha256 !== workspaceIdentitySha256(params.cell)) {
+    reasons.add("workspace_identity_mismatch");
+  }
+  const expectedWorkspaceSeedSha256 = workspaceSeedSha256([
+    ["facts.txt", Buffer.from(taskFixtureText(params.cell), "utf8")],
+  ]);
+  if (params.result.workspaceSeedSha256 !== expectedWorkspaceSeedSha256) {
+    reasons.add("workspace_seed_mismatch");
+  }
+  if (!params.result.trace) {
+    reasons.add("trace_missing");
+  } else {
+    if (params.result.trace.schemaVersion !== 4) {
+      reasons.add("trace_schema_unsupported");
+    }
+    if (params.result.trace.audit.state !== "valid") {
+      reasons.add("trace_audit_invalid");
+    }
+  }
+  if (
+    params.result.firstLogicalCallCacheStatus !== classifyMatrixCacheStatus(params.result.trace)
+  ) {
+    reasons.add("first_logical_call_cache_status_mismatch");
+  }
+  const traceRoute = params.result.trace?.route;
+  if (
+    params.result.trace &&
+    (!traceRoute ||
+      traceRoute.provider !== params.result.observedProvider ||
+      traceRoute.model !== params.result.observedModel)
+  ) {
+    reasons.add("trace_route_provenance_mismatch");
+  }
+  const receiptAudit = auditFrontierEvidenceReceipts(
+    [params.result],
+    params.contentDigestKey,
+    new Map([[params.result.id, params.expectedPromptCacheKeyDigest]]),
+  );
+  for (const reason of receiptAudit.reasons) {
+    reasons.add(reason);
+  }
   return [...reasons].toSorted();
 }
 
@@ -2161,7 +2795,11 @@ function evidenceStatus(result: CodeModeMatrixCellResult): QaEvidenceStatus {
   if (result.passed) {
     return "pass";
   }
-  if (result.failureCategory === "provider_auth" || result.failureCategory === "provider_billing") {
+  if (
+    result.failureCategory === "provider_auth" ||
+    result.failureCategory === "provider_billing" ||
+    result.failureCategory === "provider_model_access"
+  ) {
     return "blocked";
   }
   return "fail";
@@ -2205,7 +2843,7 @@ export function buildCodeModeMatrixEvidence(params: {
         {
           id: result.id,
           status: evidenceStatus(result),
-          durationMs: Math.max(1, result.elapsedMs),
+          durationMs: Math.max(1, result.wallLatencyMs ?? result.elapsedMs),
           failureMessage: result.failureCategory ?? undefined,
         },
       ],
@@ -2280,6 +2918,7 @@ export async function runCodeModeModelMatrix(
   deps: MatrixRunDependencies = {},
 ): Promise<{ exitCode: number; outputDir: string; summary: unknown }> {
   const now = deps.now?.() ?? new Date();
+  const nowMs = deps.nowMs ?? Date.now;
   const outputDir = resolveCodeModeMatrixOutputDir(options.repoRoot, options.outputDir, now);
   const resolveSourceIdentity = async (): Promise<SourceIdentity> =>
     deps.readSourceIdentity
@@ -2326,6 +2965,22 @@ export async function runCodeModeModelMatrix(
       ],
     };
   }
+  if (options.conversationProof) {
+    const exactSchedule =
+      options.modes.length === 2 &&
+      options.modes[0] === "direct" &&
+      options.modes[1] === "code" &&
+      options.tasks.length === 1 &&
+      options.tasks[0] === "dependent-read-write" &&
+      options.repetitions === 2 &&
+      options.thinking === "high";
+    if (!exactSchedule) {
+      preflight.blockedReasons = [
+        ...preflight.blockedReasons,
+        "conversation_proof_schedule_invalid",
+      ].toSorted();
+    }
+  }
   if (sourceIdentity.sourceDirty) {
     preflight.blockedReasons = [...preflight.blockedReasons, "frontier_source_dirty"].toSorted();
   }
@@ -2345,6 +3000,11 @@ export async function runCodeModeModelMatrix(
         : { state: "unavailable", sha256: null },
       model: options.models[0],
       blockedReasons: reasons,
+      plannedExecutions: {
+        matrix: cells.length,
+        conversationProof: options.conversationProof ? 2 : 0,
+        total: cells.length + (options.conversationProof ? 2 : 0),
+      },
       cells: [],
     };
     const summary = {
@@ -2375,9 +3035,8 @@ export async function runCodeModeModelMatrix(
   if (!options.dryRun) {
     await (deps.buildCliArtifacts ?? buildMatrixCliArtifacts)(options.repoRoot);
   }
-  const buildSha256 = options.dryRun
-    ? null
-    : await (deps.readBuildSha256 ?? hashRuntimeArtifacts)(options.repoRoot);
+  const readBuildIdentity = deps.readBuildSha256 ?? hashRuntimeArtifacts;
+  const buildSha256 = options.dryRun ? null : await readBuildIdentity(options.repoRoot);
   const manifest = {
     schemaVersion: MATRIX_SCHEMA_VERSION,
     status: options.dryRun ? "dry-run" : "ready",
@@ -2396,15 +3055,26 @@ export async function runCodeModeModelMatrix(
     timeoutSeconds: options.timeoutSeconds,
     thinking: options.thinking,
     keepState: options.keepState,
+    plannedExecutions: {
+      matrix: cells.length,
+      conversationProof: options.conversationProof ? 2 : 0,
+      total: cells.length + (options.conversationProof ? 2 : 0),
+    },
     cells: cells.map((cell) => cell.id),
   };
   await writeJson(path.join(outputDir, "manifest.json"), manifest);
   if (options.dryRun) {
+    const plannedExecutions = {
+      matrix: cells.length,
+      conversationProof: options.conversationProof ? 2 : 0,
+      total: cells.length + (options.conversationProof ? 2 : 0),
+    };
     const summary = {
       schemaVersion: MATRIX_SCHEMA_VERSION,
       status: "dry-run",
       cellsExecuted: 0,
-      totalPlanned: cells.length,
+      plannedExecutions,
+      totalPlanned: plannedExecutions.total,
       executionPolicy: preflight.executionPolicy,
     };
     await writeJson(path.join(outputDir, "summary.json"), summary);
@@ -2423,11 +3093,40 @@ export async function runCodeModeModelMatrix(
   frozenEnv[preflight.executionPolicy.credentialEnvName] = preflight.credentialValue;
   delete frozenEnv.NODE_COMPILE_CACHE;
   const contentDigestKey = randomBytes(32).toString("hex");
+  const runNonceByCell = new Map(
+    cells.map((cell) => [cell.id, matrixCellRunNonce(contentDigestKey, cell.id)]),
+  );
+  const promptCacheKeyDigestByCell = new Map(
+    cells.map((cell) => {
+      const runNonce = runNonceByCell.get(cell.id)!;
+      return [cell.id, promptCacheKeyDigest(contentDigestKey, runNonce)];
+    }),
+  );
   const policyFile = await createFrontierEvidencePolicyFile({
     contentDigestKey,
     configSha256: configSha256!,
     executionPolicy: preflight.executionPolicy,
   });
+  const readPolicySha256 =
+    deps.readPolicySha256 ??
+    (async (policyPath: string) =>
+      createHash("sha256")
+        .update(await fs.readFile(policyPath))
+        .digest("hex"));
+  const auditFrozenIdentity = async () =>
+    await auditFrozenMatrixIdentity({
+      expected: {
+        buildSha256: buildSha256!,
+        configSha256,
+        policySha256: policyFile.sha256,
+        source: sourceIdentity,
+      },
+      readBuildSha256: async () => await readBuildIdentity(options.repoRoot),
+      readConfigSha256: async () => (await readPinnedConfigSnapshot(options.config)).sha256,
+      readPolicySha256: async () => await readPolicySha256(policyFile.path),
+      readSourceIdentity: resolveSourceIdentity,
+    });
+  const campaignRoot = path.join(outputDir, "runtime", "campaign");
   const runtimeRoot = deps.runCell
     ? undefined
     : await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-code-mode-runtime-"));
@@ -2444,24 +3143,20 @@ export async function runCodeModeModelMatrix(
       }
     }
     const results: CodeModeMatrixCellResult[] = [];
+    let runBlockedReason: string | undefined;
     const executeCell = deps.runCell ?? runMatrixCell;
     for (const cell of cells) {
+      const frontierEvidenceRunNonce = runNonceByCell.get(cell.id)!;
+      const expectedPromptCacheKeyDigest = promptCacheKeyDigestByCell.get(cell.id)!;
       let result: CodeModeMatrixCellResult;
       let proofDrift = false;
-      const cellStartedAt = Date.now();
+      const cellStartedAt = nowMs();
       try {
-        const observedSourceIdentity = await resolveSourceIdentity();
-        if (
-          observedSourceIdentity.gitSha !== sourceIdentity.gitSha ||
-          observedSourceIdentity.sourceDirty !== sourceIdentity.sourceDirty ||
-          observedSourceIdentity.sourcePatchSha256 !== sourceIdentity.sourcePatchSha256
-        ) {
-          throw new MatrixPreflightError("frontier_source_changed");
+        const identityReasons = await auditFrozenIdentity();
+        if (identityReasons.length > 0) {
+          throw new MatrixPreflightError(identityReasons[0]!);
         }
         const observedConfig = await readPinnedConfigSnapshot(options.config);
-        if (observedConfig.sha256 !== configSha256) {
-          throw new MatrixPreflightError("proof_policy_changed");
-        }
         const observedPreflight = await evaluateMatrixPreflight({
           config: observedConfig.effective,
           configSha256: observedConfig.sha256,
@@ -2484,6 +3179,7 @@ export async function runCodeModeModelMatrix(
         }
         result = await executeCell({
           buildSha256: buildSha256 ?? "dry-run",
+          campaignRoot,
           cell,
           config: configSnapshot.effective,
           configPath: options.config,
@@ -2493,6 +3189,7 @@ export async function runCodeModeModelMatrix(
             path: policyFile.path,
             sha256: policyFile.sha256,
           },
+          frontierEvidenceRunNonce,
           gitSha: sourceIdentity.gitSha,
           keepState: options.keepState,
           outputDir,
@@ -2511,59 +3208,50 @@ export async function runCodeModeModelMatrix(
         };
         if (error instanceof MatrixPreflightError) {
           proofDrift = true;
-          result = proofDriftResult(cell, provenance, Date.now() - cellStartedAt, error);
+          result = proofDriftResult(cell, provenance, nowMs() - cellStartedAt, error);
         } else {
-          result = harnessFailureResult(cell, provenance, Date.now() - cellStartedAt, error);
+          result = harnessFailureResult(cell, provenance, nowMs() - cellStartedAt, error);
         }
       }
-      const provenanceReasons = validateCellResultProvenance({
-        cell,
-        expectedBuildSha256: buildSha256 ?? "dry-run",
-        expectedConfigSha256: configSha256,
-        expectedSource: sourceIdentity,
-        result,
-      });
-      if (provenanceReasons.length > 0) {
-        proofDrift = true;
-        result = proofDriftResult(
+      const provenanceReasons = new Set(
+        validateCellResultProvenance({
           cell,
-          {
-            buildSha256: buildSha256 ?? "dry-run",
-            configSha256,
-            ...sourceIdentity,
-          },
-          Date.now() - cellStartedAt,
-          new MatrixPreflightError(provenanceReasons[0]!),
+          contentDigestKey,
+          expectedBuildSha256: buildSha256 ?? "dry-run",
+          expectedConfigSha256: configSha256,
+          expectedPromptCacheKeyDigest,
+          expectedSource: sourceIdentity,
+          result,
+        }),
+      );
+      for (const reason of auditFrontierEvidenceReceipts(
+        [...results, result],
+        contentDigestKey,
+        promptCacheKeyDigestByCell,
+      ).reasons) {
+        provenanceReasons.add(reason);
+      }
+      if (provenanceReasons.size > 0) {
+        proofDrift = true;
+        result = preserveResultAsProofDrift(
+          result,
+          nowMs() - cellStartedAt,
+          new MatrixPreflightError([...provenanceReasons].toSorted()[0]!),
         );
       }
-      const postRunReasons: string[] = [];
-      const postRunSourceIdentity = await resolveSourceIdentity();
-      if (
-        postRunSourceIdentity.gitSha !== sourceIdentity.gitSha ||
-        postRunSourceIdentity.sourceDirty !== sourceIdentity.sourceDirty ||
-        postRunSourceIdentity.sourcePatchSha256 !== sourceIdentity.sourcePatchSha256
-      ) {
-        postRunReasons.push("source_mismatch");
-      }
-      if ((await readPinnedConfigSnapshot(options.config)).sha256 !== configSha256) {
-        postRunReasons.push("config_mismatch");
-      }
-      if (!deps.runCell && (await hashRuntimeArtifacts(options.repoRoot)) !== buildSha256) {
-        postRunReasons.push("build_mismatch");
-      }
+      const postRunReasons = await auditFrozenIdentity();
       if (postRunReasons.length > 0) {
         proofDrift = true;
-        result = proofDriftResult(
-          cell,
-          {
-            buildSha256: buildSha256 ?? "dry-run",
-            configSha256,
-            ...sourceIdentity,
-          },
-          Date.now() - cellStartedAt,
+        result = preserveResultAsProofDrift(
+          result,
+          nowMs() - cellStartedAt,
           new MatrixPreflightError(postRunReasons[0]!),
         );
       }
+      result = {
+        ...result,
+        wallLatencyMs: nowMs() - cellStartedAt,
+      };
       results.push(result);
       await fs.appendFile(
         resultsPath,
@@ -2571,9 +3259,21 @@ export async function runCodeModeModelMatrix(
         "utf8",
       );
       const label = result.passed ? "PASS" : `FAIL ${result.failureCategory ?? "unknown"}`;
-      console.log(`[code-mode-matrix] ${label} ${result.id} ${result.elapsedMs}ms`);
+      console.log(
+        `[code-mode-matrix] ${label} ${result.id} ${result.wallLatencyMs ?? result.elapsedMs}ms`,
+      );
       if (proofDrift) {
+        runBlockedReason = result.error?.kind ?? result.failureCategory ?? "proof_drift";
         console.log("[code-mode-matrix] stopping after proof policy drift");
+        break;
+      }
+      if (
+        result.failureCategory === "provider_auth" ||
+        result.failureCategory === "provider_billing" ||
+        result.failureCategory === "provider_model_access"
+      ) {
+        runBlockedReason = result.failureCategory;
+        console.log(`[code-mode-matrix] stopping after ${result.failureCategory}`);
         break;
       }
     }
@@ -2582,9 +3282,75 @@ export async function runCodeModeModelMatrix(
     const failed = results.filter((result) => !result.passed).length;
     const firstPassPassed = groups.filter((group) => group.firstPassPassed).length;
     const eventualPassed = groups.filter((group) => group.eventualPassed).length;
-    const frontierEvidenceAudit = auditFrontierEvidenceReceipts(results, contentDigestKey);
+    const frontierEvidenceAudit = auditFrontierEvidenceReceipts(
+      results,
+      contentDigestKey,
+      promptCacheKeyDigestByCell,
+    );
+    const betaGate = buildCodeModeMatrixBetaGate(results);
+    let conversationProof: MatrixConversationProofSummary | undefined;
+    if (options.conversationProof) {
+      const blockedReasons: string[] = [];
+      if (runBlockedReason) {
+        blockedReasons.push(runBlockedReason);
+      }
+      if (results.length !== cells.length) {
+        blockedReasons.push("abba_incomplete");
+      }
+      if (!frontierEvidenceAudit.valid) {
+        blockedReasons.push("frontier_receipts_invalid");
+      }
+      if (betaGate.bars.auditableMatchedTraces !== "pass") {
+        blockedReasons.push("matched_traces_not_auditable");
+      }
+      if (betaGate.bars.coldInitialPerCell !== "pass") {
+        blockedReasons.push("cold_initial_per_cell_not_proven");
+      }
+      blockedReasons.push(...(await auditFrozenIdentity()));
+      if (!configSnapshot.effective || !configSha256 || !buildSha256) {
+        blockedReasons.push("frozen_identity_unavailable");
+      }
+      if (blockedReasons.length > 0) {
+        conversationProof = { status: "blocked", blockedReasons: blockedReasons.toSorted() };
+        await fs.mkdir(path.join(outputDir, "conversation-proof"), { recursive: true });
+        await writeJson(
+          path.join(outputDir, "conversation-proof", "summary.json"),
+          conversationProof,
+        );
+      } else {
+        const runConversationProof =
+          deps.runConversationProof ?? runCodeModeMatrixConversationProof;
+        conversationProof = await runConversationProof({
+          buildSha256: buildSha256!,
+          config: configSnapshot.effective!,
+          configSha256: configSha256!,
+          executionPolicy: preflight.executionPolicy,
+          frozenEnv,
+          gitSha: sourceIdentity.gitSha,
+          model: options.models[0]!,
+          outputDir,
+          repoRoot: options.repoRoot,
+        });
+        const postConversationReasons = await auditFrozenIdentity();
+        if (postConversationReasons.length > 0) {
+          conversationProof = {
+            ...conversationProof,
+            status: "blocked",
+            observedStatus: conversationProof.status,
+            blockedReasons: postConversationReasons,
+          };
+          runBlockedReason ??= postConversationReasons[0];
+          await writeJson(
+            path.join(outputDir, "conversation-proof", "summary.json"),
+            conversationProof,
+          );
+        }
+      }
+    }
     const summary = {
       schemaVersion: MATRIX_SCHEMA_VERSION,
+      status: runBlockedReason ? "blocked" : "complete",
+      ...(runBlockedReason ? { blockedReasons: [runBlockedReason] } : {}),
       finishedAt: new Date().toISOString(),
       ...sourceIdentity,
       buildSha256,
@@ -2600,6 +3366,22 @@ export async function runCodeModeModelMatrix(
       },
       groups,
       frontierEvidenceAudit,
+      betaGate,
+      ...(conversationProof
+        ? {
+            conversationProof: {
+              path: "conversation-proof/summary.json",
+              status: conversationProof.status,
+              ...("counts" in conversationProof ? { counts: conversationProof.counts } : {}),
+              ...("observedStatus" in conversationProof
+                ? { observedStatus: conversationProof.observedStatus }
+                : {}),
+              ...("blockedReasons" in conversationProof
+                ? { blockedReasons: conversationProof.blockedReasons }
+                : {}),
+            },
+          }
+        : {}),
     };
     await writeJson(path.join(outputDir, "summary.json"), summary);
     await writeJson(
@@ -2611,12 +3393,19 @@ export async function runCodeModeModelMatrix(
       }),
     );
     return {
-      exitCode: (failed > 0 && !options.allowFailures) || !frontierEvidenceAudit.valid ? 1 : 0,
+      exitCode: resolveCodeModeMatrixExitCode({
+        allowFailures: options.allowFailures,
+        betaGateState: betaGate.state,
+        ...(conversationProof ? { conversationProofStatus: conversationProof.status } : {}),
+        failed,
+        frontierEvidenceValid: frontierEvidenceAudit.valid,
+      }),
       outputDir,
       summary,
     };
   } finally {
     await policyFile.cleanup();
+    await fs.rm(campaignRoot, { force: true, recursive: true });
     if (runtimeRoot) {
       await fs.rm(runtimeRoot, { force: true, recursive: true });
     }
