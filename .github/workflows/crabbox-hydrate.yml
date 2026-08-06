@@ -368,6 +368,7 @@ jobs:
           CRABBOX_JOB: ${{ inputs.crabbox_job }}
         run: |
           set -euo pipefail
+          export PNPM_CONFIG_VERIFY_DEPS_BEFORE_RUN=install
           job="${CRABBOX_JOB}"
           if [ -z "$job" ]; then job=hydrate; fi
           case "$CRABBOX_ID" in
@@ -787,6 +788,7 @@ jobs:
           CRABBOX_JOB: ${{ inputs.crabbox_job }}
         run: |
           set -euo pipefail
+          export PNPM_CONFIG_VERIFY_DEPS_BEFORE_RUN=install
           job="${CRABBOX_JOB}"
           if [ -z "$job" ]; then job=hydrate-github; fi
           case "$CRABBOX_ID" in
