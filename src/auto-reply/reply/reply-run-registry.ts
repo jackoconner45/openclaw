@@ -20,6 +20,7 @@ import { diagnosticLogger as diag } from "../../logging/diagnostic-runtime.js";
 import type { MediaFact } from "../../media/media-facts.js";
 import type { PromptImageOrderEntry } from "../../media/prompt-image-order.js";
 import type { UserTurnTranscriptRecorder } from "../../sessions/user-turn-transcript.types.js";
+import { createDeferred } from "../../shared/deferred.js";
 import { resolveGlobalSingleton } from "../../shared/global-singleton.js";
 import { resolveTimerTimeoutMs } from "../../shared/number-coercion.js";
 import type {
@@ -209,6 +210,8 @@ export type ReplyOperation = {
    * Dispatch uses this while a user-visible failure payload still needs delivery.
    */
   retainFailureUntilComplete(): void;
+  /** Settles after the lifecycle owner's final delivery/persistence barrier. */
+  readonly ownerSettlement?: Promise<void>;
   complete(): void;
   /**
    * Complete the operation, clear active-run state, then run follow-up work.
@@ -387,9 +390,13 @@ const afterClearCallbacksByOperation = new WeakMap<
   ReplyOperation,
   Set<(sessionId: string) => void>
 >();
+type ReplyOperationStaleExpiryOptions = {
+  afterClearBarrier?: PromiseLike<unknown>;
+  followupAdmissionBarrierTimeout?: number | ReplyFollowupAdmissionBarrierTimeoutPolicy;
+};
 const expireReplyOperationByOperation = new WeakMap<
   ReplyOperation,
-  (reason: ReplyOperationStaleReason) => boolean
+  (reason: ReplyOperationStaleReason, options?: ReplyOperationStaleExpiryOptions) => boolean
 >();
 
 function getAttachedBackend(operation: ReplyOperation): ReplyBackendHandle | undefined {
@@ -435,6 +442,11 @@ export function runAfterReplyOperationClear(
   afterClear: (sessionId: string) => void,
 ): void {
   if (replyRunState.activeRunsByKey.get(operation.key) !== operation) {
+    const barrier = replyRunState.followupAdmissionBarriersByKey.get(operation.key);
+    if (barrier) {
+      void barrier.settled.then(() => afterClear(barrier.sessionId));
+      return;
+    }
     afterClear(operation.sessionId);
     return;
   }
@@ -607,9 +619,19 @@ export function createReplyOperation(params: {
   let staleExpiryReason: ReplyOperationStaleReason | undefined;
   let result: ReplyOperationResult | null = null;
   let stateCleared = false;
+  let clearBarrierSettlement: Promise<void> | undefined;
   let retainFailureUntilComplete = false;
   let terminalRecovery = false;
   let acceptedSteeredInboundAudio = false;
+  const ownerSettlement = createDeferred();
+  let ownerSettled = false;
+  const settleOwner = () => {
+    if (ownerSettled) {
+      return;
+    }
+    ownerSettled = true;
+    ownerSettlement.resolve(undefined);
+  };
   const startedAtMs = Date.now();
   const lifecycleGeneration = getAgentEventLifecycleGeneration();
   let lastActivityAtMs = startedAtMs;
@@ -670,6 +692,7 @@ export function createReplyOperation(params: {
     void registeredBarrier.settled.then(() =>
       flushReplyOperationAfterClear(operation, registeredBarrier.sessionId),
     );
+    clearBarrierSettlement = registeredBarrier.settled;
   };
 
   const abortInternally = (reason?: unknown) => {
@@ -908,12 +931,14 @@ export function createReplyOperation(params: {
     retainFailureUntilComplete() {
       retainFailureUntilComplete = true;
     },
+    ownerSettlement: ownerSettlement.promise,
     complete() {
       if (!result) {
         setResult({ kind: "completed" });
         phase = "completed";
       }
       clearState();
+      settleOwner();
     },
     completeThen(afterClear) {
       runAfterReplyOperationClear(operation, afterClear);
@@ -924,7 +949,19 @@ export function createReplyOperation(params: {
         setResult({ kind: "completed" });
         phase = "completed";
       }
+      const wasAlreadyCleared = stateCleared;
       clearState(barrier, timeoutMs);
+      // This barrier owns dispatch delivery and terminal persistence. Stale
+      // expiry may have already cleared the slot, but recovery must still wait
+      // for that old owner's durable work before admitting a queued turn.
+      const completionSettlement = wasAlreadyCleared
+        ? waitForReplyBarrierSettlement(barrier, timeoutMs)
+        : clearBarrierSettlement;
+      if (completionSettlement) {
+        void completionSettlement.then(settleOwner);
+      } else {
+        settleOwner();
+      }
     },
     fail(code, cause) {
       abortFrozenOperations.add(operation);
@@ -978,7 +1015,7 @@ export function createReplyOperation(params: {
     },
   };
 
-  expireReplyOperationByOperation.set(operation, (reason) => {
+  expireReplyOperationByOperation.set(operation, (reason, options) => {
     if (replyRunState.activeRunsByKey.get(currentSessionKey) !== operation) {
       return false;
     }
@@ -994,6 +1031,10 @@ export function createReplyOperation(params: {
       setResult({ kind: "failed", code: "run_stalled" });
       phase = "failed";
     }
+    // Install the recovery fence before backend cancellation. Cancel can
+    // synchronously re-enter complete(), which must not flush queued turns
+    // while the old lifecycle owner is still finalizing.
+    clearState(options?.afterClearBarrier, options?.followupAdmissionBarrierTimeout);
     getAttachedBackend(operation)?.cancel("superseded");
     abortInternally(createAbortError("Reply operation expired as stale"));
     diag.warn(
@@ -1001,7 +1042,6 @@ export function createReplyOperation(params: {
         result,
       )} ageMs=${Date.now() - lastActivityAtMs} ranForMs=${Date.now() - startedAtMs}`,
     );
-    clearState();
     return true;
   });
   const finalizationLease = replyRunSettle.createReplyRunFinalizationLease({
@@ -1109,16 +1149,42 @@ export function createReplyOperation(params: {
 export function expireStaleReplyOperation(
   operation: ReplyOperation,
   reason: ReplyOperationStaleReason,
+  options?: ReplyOperationStaleExpiryOptions,
 ): boolean {
-  return expireReplyOperationByOperation.get(operation)?.(reason) ?? false;
+  return expireReplyOperationByOperation.get(operation)?.(reason, options) ?? false;
+}
+
+/** Wait for the old lifecycle owner's terminal work after stale expiry clears its slot. */
+export async function waitForReplyOperationOwnerSettlement(
+  operation: ReplyOperation,
+  timeoutMs: number,
+): Promise<boolean> {
+  const settlement = operation.ownerSettlement;
+  if (!settlement) {
+    return true;
+  }
+  const resolvedTimeoutMs = resolveTimerTimeoutMs(timeoutMs, 100, 100);
+  let timer: NodeJS.Timeout | undefined;
+  const settled = await Promise.race([
+    settlement.then(() => true),
+    new Promise<boolean>((resolve) => {
+      timer = setTimeout(() => resolve(false), resolvedTimeoutMs);
+      timer.unref?.();
+    }),
+  ]);
+  if (timer) {
+    clearTimeout(timer);
+  }
+  return settled;
 }
 
 export function expireStaleReplyRunBySessionId(
   sessionId: string,
   reason: ReplyOperationStaleReason,
+  options?: Parameters<typeof expireStaleReplyOperation>[2],
 ): boolean {
   const operation = resolveReplyRunForCurrentSessionId(sessionId);
-  return operation ? expireStaleReplyOperation(operation, reason) : false;
+  return operation ? expireStaleReplyOperation(operation, reason, options) : false;
 }
 
 // lastActivityAtMs is refreshed by agent events only; timers and user-message
