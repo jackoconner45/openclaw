@@ -7,6 +7,10 @@ import { setInternalDiagnosticEventListenerCounts } from "./diagnostic-event-lis
 import { isTrustedOtelDiagnosticListener } from "./diagnostic-otel-listener-provenance.js";
 import { consumeHostPluginUsageDiagnosticEvent } from "./diagnostic-plugin-usage-provenance.js";
 import {
+  consumeCoreSemanticRunProgressDiagnosticEvent,
+  CORE_SEMANTIC_RUN_PROGRESS_METADATA_KEY,
+} from "./diagnostic-semantic-run-progress-provenance.js";
+import {
   getActiveDiagnosticTraceContext,
   type DiagnosticTraceContext,
 } from "./diagnostic-trace-context.js";
@@ -864,6 +868,13 @@ export type DiagnosticEventMetadata = Readonly<{
   trusted: boolean;
 }>;
 
+type InternalDiagnosticEventMetadata = DiagnosticEventMetadata &
+  Readonly<{
+    // String metadata survives duplicate module instances sharing dispatcher state;
+    // only the non-SDK core emitter can set this semantic authority.
+    [CORE_SEMANTIC_RUN_PROGRESS_METADATA_KEY]?: boolean;
+  }>;
+
 export type DiagnosticModelCallContent = Readonly<{
   inputMessages?: unknown;
   outputMessages?: unknown;
@@ -1302,6 +1313,7 @@ function createInternalDiagnosticMetadata(trusted: boolean): DiagnosticEventMeta
 
 type EmitDiagnosticEventOptions = {
   allowSecurityEvent?: boolean;
+  coreSemanticRunProgress?: boolean;
   hostPluginId?: string;
   internal?: boolean;
   privateData?: DiagnosticEventPrivateData;
@@ -1327,8 +1339,11 @@ function emitDiagnosticEventWithTrust(
   const enriched = enrichDiagnosticEvent(state, event);
   const { hostPluginId, internal = false, privateData } = options;
   const trustedTraceContext = options.trustedTraceContext === true;
-  const metadata = {
+  const metadata: InternalDiagnosticEventMetadata = {
     ...(internal ? createInternalDiagnosticMetadata(trusted) : { trusted }),
+    ...(options.coreSemanticRunProgress === true
+      ? { [CORE_SEMANTIC_RUN_PROGRESS_METADATA_KEY]: true }
+      : {}),
     ...(trustedTraceContext ? { trustedTraceContext } : {}),
   };
   const prepareTracePropagation = trusted && shouldPrepareDiagnosticTracePropagation(enriched);
@@ -1425,7 +1440,11 @@ export function getInternalDiagnosticEventSequence(): number {
 /** Emits a trusted diagnostic event from core/runtime-owned instrumentation. */
 export function emitTrustedDiagnosticEvent(event: DiagnosticEventInput) {
   const hostPluginId = consumeHostPluginUsageDiagnosticEvent(event);
-  emitDiagnosticEventWithTrust(event, true, hostPluginId ? { hostPluginId, internal: true } : {});
+  const coreSemanticRunProgress = consumeCoreSemanticRunProgressDiagnosticEvent(event);
+  emitDiagnosticEventWithTrust(event, true, {
+    ...(hostPluginId ? { hostPluginId, internal: true } : {}),
+    ...(coreSemanticRunProgress ? { coreSemanticRunProgress: true } : {}),
+  });
 }
 
 /** Keeps trusted internal skill accounting alive when optional diagnostics are disabled. */
