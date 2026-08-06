@@ -8,6 +8,10 @@ import { createOpenClawCodingTools } from "../../plugin-sdk/agent-harness.js";
 import { mintSecretSentinel } from "../../secrets/sentinel.js";
 import { isHostScopedAgentToolActive } from "../agent-tools.ring-zero-context.js";
 import { testing as cliBackendsTesting } from "../cli-backends.test-support.js";
+import {
+  bindEmbeddedRunAccountingObservers,
+  resolveEmbeddedRunAccountingObservers,
+} from "../embedded-agent-runner/run/accounting-observers.js";
 import type {
   EmbeddedRunAttemptParams,
   EmbeddedRunAttemptResult,
@@ -424,6 +428,10 @@ describe("runAgentHarnessAttempt", () => {
     };
     registerAgentHarness(harness, { ownerPluginId: "codex" });
     const params = createAttemptParams(providerRuntimeConfig("codex", "codex"));
+    bindEmbeddedRunAccountingObservers(params, {
+      onAgentSubmission: vi.fn(),
+      onAttemptObserved: vi.fn(),
+    });
     const settledAttempt = createAttemptResult("settled");
 
     await expect(
@@ -439,6 +447,8 @@ describe("runAgentHarnessAttempt", () => {
         attempt: expect.objectContaining({ provider: "codex" }),
       }),
     );
+    const handedOffAttempt = finalizeSettledTurn.mock.calls[0]?.[0].attempt;
+    expect(resolveEmbeddedRunAccountingObservers(handedOffAttempt as object)).toBeUndefined();
   });
 
   it("fails closed when the selected harness has no settled-turn finalizer", async () => {
@@ -603,7 +613,9 @@ describe("runAgentHarnessAttempt", () => {
 
   it("binds the same host OpenClaw scope to the built-in OpenClaw harness", async () => {
     let toolNames: string[] = [];
-    agentRunAttempt.mockImplementationOnce(async () => {
+    let handedOffAttempt: EmbeddedRunAttemptParams | undefined;
+    agentRunAttempt.mockImplementationOnce(async (attempt) => {
+      handedOffAttempt = attempt as EmbeddedRunAttemptParams;
       await Promise.resolve();
       toolNames = createOpenClawCodingTools({
         config: { tools: { allow: ["read"], deny: ["openclaw"], toolSearch: true } },
@@ -623,10 +635,21 @@ describe("runAgentHarnessAttempt", () => {
     ) as EmbeddedRunAttemptParams & { systemAgentTool?: SystemAgentToolOptions };
     params.toolsAllow = ["openclaw"];
     params.systemAgentTool = { surface: "gateway", proposalRef: {}, directiveRef: {} };
+    const onAgentSubmission = vi.fn();
+    const onEmbeddedRunAttemptObserved = vi.fn();
+    bindEmbeddedRunAccountingObservers(params, {
+      onAgentSubmission,
+      onAttemptObserved: onEmbeddedRunAttemptObserved,
+    });
 
     const result = await runAgentHarnessAttempt(params);
 
     expect(result.sessionIdUsed).toBe("openclaw");
+    expect(resolveEmbeddedRunAccountingObservers(handedOffAttempt as object)).toEqual({
+      onAgentSubmission,
+      onAttemptObserved: onEmbeddedRunAttemptObserved,
+    });
+    expect(handedOffAttempt).not.toHaveProperty("systemAgentTool");
     expect(toolNames).toEqual(["openclaw"]);
     expect(isHostScopedAgentToolActive("openclaw")).toBe(false);
   });
@@ -647,6 +670,10 @@ describe("runAgentHarnessAttempt", () => {
     const secret = "plugin-provider-secret";
     const sentinel = mintSecretSentinel(secret, { label: "model-auth:codex" });
     const params = createAttemptParams(providerRuntimeConfig("codex", "codex"));
+    bindEmbeddedRunAccountingObservers(params, {
+      onAgentSubmission: vi.fn(),
+      onAttemptObserved: vi.fn(),
+    });
     params.resolvedApiKey = sentinel;
     params.model = {
       ...params.model,
@@ -659,6 +686,7 @@ describe("runAgentHarnessAttempt", () => {
     expect(handedOff?.resolvedApiKey).toBe(secret);
     expect(handedOff?.model.headers?.Authorization).toBe(`Bearer ${secret}`);
     expect(handedOff?.model.headers?.["X-Optional"]).toBeNull();
+    expect(resolveEmbeddedRunAccountingObservers(handedOff as object)).toBeUndefined();
     expect(params.resolvedApiKey).toBe(sentinel);
   });
 

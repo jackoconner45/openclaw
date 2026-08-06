@@ -9,6 +9,10 @@ import { applyAuthHeaderOverride, applyLocalNoAuthHeaderOverride } from "../../m
 import type { AgentRuntimePlan } from "../../runtime-plan/types.js";
 import { createToolTerminalObserver } from "../../tool-terminal-outcome.js";
 import type { SystemAgentToolOptions } from "../../tools/system-agent-tool.js";
+import {
+  bindEmbeddedRunAccountingObservers,
+  resolveEmbeddedRunAccountingObservers,
+} from "./accounting-observers.js";
 import { prepareExecApprovalContinuationForAttempt } from "./attempt-exec-approval-continuation.js";
 import { applyResolvedToolPromptFinalizer } from "./attempt-prompt-tool-policy.js";
 import { runEmbeddedAttemptWithBackend } from "./backend.js";
@@ -425,6 +429,7 @@ export async function dispatchEmbeddedRunAttempt(input: {
     onUserMessagePersistenceInvalidated: control.onUserMessagePersistenceInvalidated,
     onAssistantErrorMessagePersisted: params.onAssistantErrorMessagePersisted,
   };
+  bindEmbeddedRunAccountingObservers(attemptParams, resolveEmbeddedRunAccountingObservers(params));
   const rawAttempt = await runEmbeddedAttemptWithBackend(attemptParams)
     .catch((err: unknown): never => {
       throw control.getPostCompactionAbortError() ?? err;

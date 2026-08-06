@@ -2,12 +2,10 @@
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import type { VerboseLevel } from "../auto-reply/thinking.js";
 import type { CliDeps } from "../cli/deps.types.js";
-import { getRuntimeConfig } from "../config/io.js";
 import { resolveSessionWorkStartError } from "../config/sessions/lifecycle.js";
 import { buildRestartRecoveryClaimCleanupPatch } from "../config/sessions/restart-recovery-state.js";
 import type { RestartRecoveryTerminalDeliveryEvidenceResult } from "../config/sessions/restart-recovery-types.js";
 import type { SessionEntry } from "../config/sessions/types.js";
-import { withLocalGatewayRequestScope } from "../gateway/local-request-context.js";
 import {
   assertAgentRunLifecycleGenerationCurrent,
   captureAgentRunLifecycleGeneration,
@@ -45,11 +43,17 @@ import {
   prepareAgentCommandExecution,
   resolveExplicitAgentCommandSessionKey,
 } from "./command/prepare.js";
+import {
+  bindAgentCommandRunAccounting,
+  runWithAgentCommandAccounting,
+} from "./command/run-accounting.js";
+import type { RunAccountingAccumulator } from "./command/run-accounting.types.js";
 import { runEmbeddedAgentAttempt } from "./command/run-embedded-attempt.js";
 import { loadSessionStoreRuntime, resolveAgentCommandDeps } from "./command/runtime-loaders.js";
 import { persistSessionEntry, prepareCurrentRunDelivery } from "./command/session-helpers.js";
 import { prepareEmbeddedSessionState } from "./command/session-preparation.js";
 import { clearRotatedSessionMetadata } from "./command/session.js";
+import { runTrustedAgentCommandEntry } from "./command/trusted-entry.js";
 import type {
   AgentCommandGatewayIngressOpts,
   AgentCommandIngressOpts,
@@ -73,6 +77,7 @@ async function agentCommandInternal(
   prepared: Awaited<ReturnType<typeof prepareAgentCommandExecution>>,
   initialOpts: AgentCommandOpts,
   admissionIngress: AgentCommandAdmissionIngress,
+  commandRunAccounting: RunAccountingAccumulator | undefined,
   runtime: RuntimeEnv = defaultRuntime,
   deps?: CliDeps,
 ) {
@@ -404,6 +409,7 @@ async function agentCommandInternal(
 
       if (!isRawModelRun && acpResolution?.kind === "ready" && sessionKey) {
         assertAgentRunLifecycleGenerationCurrent(lifecycleGeneration);
+        commandRunAccounting?.markOpaqueWork("acp_runtime");
         return await runAcpAgentCommand({
           cfg,
           deps: resolvedDeps,
@@ -500,6 +506,7 @@ async function agentCommandInternal(
         modelSelection,
         embeddedSessionState,
         trackInternalModelRunTarget,
+        commandRunAccounting,
       });
       if (embeddedAttempt.fallbackExhausted) {
         opts.onModelFallbackExhausted?.();
@@ -526,6 +533,7 @@ async function agentCommandInternal(
         onTerminalDeliveryEvidenceChanged: (evidence) => {
           restartRecoveryTerminalDeliveryEvidence = evidence;
         },
+        commandRunAccounting,
       });
       sessionEntry = finalized.sessionEntry;
       runOwnedSessionId = finalized.runOwnedSessionId;
@@ -596,46 +604,24 @@ async function agentCommandInternal(
 async function agentCommandWithAdmissionIngress(
   opts: AgentCommandOpts,
   admissionIngress: AgentCommandAdmissionIngress,
+  commandRunAccounting: RunAccountingAccumulator | undefined,
   runtime: RuntimeEnv = defaultRuntime,
   deps?: CliDeps,
 ) {
-  const resolvedDeps = await measureAgentStartup("command-dependencies", () =>
-    resolveAgentCommandDeps(deps),
-  );
-  const lifecycleGeneration =
-    opts.lifecycleGeneration ?? captureAgentRunLifecycleGeneration(opts.runId ?? "");
-  return await withAgentRunLifecycleGeneration(lifecycleGeneration, () =>
-    withLocalGatewayRequestScope(
-      {
-        deps: resolvedDeps,
-        getRuntimeConfig,
-      },
-      async () =>
-        await runWithAgentCommandRecoveryOwner({
-          lifecycleGeneration,
-          mode: "reject_uncoordinated",
-          opts: {
-            ...opts,
-            lifecycleGeneration,
-            // Only the local entrypoint may inherit trusted-operator defaults.
-            senderIsOwner: opts.senderIsOwner ?? true,
-            allowModelOverride: opts.allowModelOverride ?? true,
-          },
-          prepare: async (preparedOpts) =>
-            await measureAgentStartup("command-prepare", () =>
-              prepareAgentCommandExecution(preparedOpts, runtime),
-            ),
-          run: async (prepared) =>
-            await agentCommandInternal(
-              prepared,
-              prepared.opts,
-              admissionIngress,
-              runtime,
-              resolvedDeps,
-            ),
-        }),
-    ),
-  );
+  return await runTrustedAgentCommandEntry({
+    opts,
+    runtime,
+    deps,
+    run: async (prepared, resolvedDeps) =>
+      await agentCommandInternal(
+        prepared,
+        prepared.opts,
+        admissionIngress,
+        commandRunAccounting,
+        runtime,
+        resolvedDeps,
+      ),
+  });
 }
 
 export async function agentCommand(
@@ -644,7 +630,17 @@ export async function agentCommand(
   deps?: CliDeps,
 ) {
   const { localIngress } = executionIdentity;
-  return await agentCommandWithAdmissionIngress(opts, localIngress, runtime, deps);
+  return await runWithAgentCommandAccounting(async (commandRunAccounting) => {
+    const result = await agentCommandWithAdmissionIngress(
+      opts,
+      localIngress,
+      commandRunAccounting,
+      runtime,
+      deps,
+    );
+    bindAgentCommandRunAccounting(result?.meta, commandRunAccounting.project());
+    return result;
+  });
 }
 
 export async function agentCommandFromSystem(
@@ -654,7 +650,7 @@ export async function agentCommandFromSystem(
   deps?: CliDeps,
 ) {
   const ingress = executionIdentity.systemIngress(admission.boundary);
-  return await agentCommandWithAdmissionIngress(opts, ingress, runtime, deps);
+  return await agentCommandWithAdmissionIngress(opts, ingress, undefined, runtime, deps);
 }
 
 async function agentCommandFromIngressInternal(
@@ -671,7 +667,7 @@ async function agentCommandFromIngressInternal(
   const lifecycleGeneration =
     opts.lifecycleGeneration ?? captureAgentRunLifecycleGeneration(opts.runId ?? "");
   return await withAgentRunLifecycleGeneration(lifecycleGeneration, async () => {
-    const result = await runWithAgentCommandRecoveryOwner({
+    const commandResult = await runWithAgentCommandRecoveryOwner({
       lifecycleGeneration,
       mode: "claim",
       opts: {
@@ -686,16 +682,17 @@ async function agentCommandFromIngressInternal(
           prepared,
           prepared.opts,
           { kind: "api", boundary: "agent-command.from-ingress", state: "unknown" },
+          undefined,
           runtime,
           deps,
         ),
     });
 
-    if (result) {
-      emitIngressModelUsageDiagnostic(result, opts);
+    if (commandResult) {
+      emitIngressModelUsageDiagnostic(commandResult, opts);
     }
 
-    return result;
+    return commandResult;
   });
 }
 

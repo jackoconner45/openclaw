@@ -16,6 +16,10 @@ import type { AgentSession, SessionManager } from "../../sessions/index.js";
 import type { NormalizedUsage } from "../../usage.js";
 import { runContextEngineMaintenance } from "../context-engine-maintenance.js";
 import { log } from "../logger.js";
+import {
+  markContextEngineLlmCompleteInvocation,
+  resolveEmbeddedRunAccountingObservers,
+} from "./accounting-observers.js";
 import { buildEmbeddedAgentEndContext } from "./agent-end-context.js";
 import {
   finalizeAttemptContextEngineTurn,
@@ -86,6 +90,7 @@ export async function completeEmbeddedAttemptAfterTurn(
   // Context-engine hooks may call runtime LLM capabilities. Only the transcript
   // rewrite callback reacquires the synchronous session write boundary.
   if (activeContextEngine && !state.beforeAgentFinalizeRevisionReason) {
+    const onLlmCompleteInvocation = () => markContextEngineLlmCompleteInvocation(attempt);
     const lifecycleState = input.readLifecycleState();
     const afterTurnRuntimeContext = buildAfterTurnRuntimeContextFromUsage({
       attempt,
@@ -96,6 +101,7 @@ export async function completeEmbeddedAttemptAfterTurn(
       promptCache: state.promptCache,
       activeAgentId: runtime.sessionAgentId,
       contextEnginePluginId: runtime.resolveActiveContextEnginePluginId(),
+      onLlmCompleteInvocation,
     });
     await finalizeAttemptContextEngineTurn({
       contextEngine: activeContextEngine,
@@ -131,6 +137,11 @@ export async function completeEmbeddedAttemptAfterTurn(
           runtimeSettings: contextParams.runtimeSettings,
           config: attempt.config,
           agentId: runtime.sessionAgentId,
+          onLlmCompleteInvocation,
+          onDeferredMaintenance: () =>
+            resolveEmbeddedRunAccountingObservers(attempt)?.onOpaqueWork?.(
+              "deferred_context_engine_maintenance",
+            ),
         }),
       sessionManager,
       config: attempt.config,

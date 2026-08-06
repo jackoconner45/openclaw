@@ -21,6 +21,10 @@ import {
 } from "./run.incomplete-turn.test-support.js";
 import { makeAttemptResult } from "./run.overflow-compaction.fixture.js";
 import {
+  bindEmbeddedRunAccountingObservers,
+  resolveEmbeddedRunAccountingObservers,
+} from "./run/accounting-observers.js";
+import {
   buildAttemptReplayMetadata,
   DEFAULT_EMPTY_RESPONSE_RETRY_LIMIT,
   DEFAULT_REASONING_ONLY_RETRY_LIMIT,
@@ -1088,6 +1092,19 @@ describe("runEmbeddedAgent incomplete-turn safety", () => {
   });
 
   it("continues once after settled side-effecting tools finish without a final answer", async () => {
+    const onEmbeddedRunAttemptObserved = vi.fn();
+    mockedResolveModelAsync.mockResolvedValue({
+      model: {
+        provider: "openai",
+        id: "effective-model",
+        contextWindow: 200_000,
+        api: "openai-responses",
+        baseUrl: "https://api.openai.com/v1",
+      },
+      error: null,
+      authStorage: { setRuntimeApiKey: vi.fn() },
+      modelRegistry: {},
+    });
     const toolUseAssistant = {
       role: "assistant",
       stopReason: "toolUse",
@@ -1104,6 +1121,7 @@ describe("runEmbeddedAgent incomplete-turn safety", () => {
       markUserMessagePersisted(attemptParams);
       return makeAttemptResult({
         assistantTexts: [],
+        attemptUsage: { input: 10, output: 2, total: 12 },
         toolMetas: [{ toolName: "write", meta: "path=note.txt" }],
         itemLifecycle: { startedCount: 1, completedCount: 1, activeCount: 0 },
         messagesSnapshot: settledToolResults,
@@ -1121,6 +1139,7 @@ describe("runEmbeddedAgent incomplete-turn safety", () => {
     mockedRunEmbeddedAttempt.mockResolvedValueOnce(
       makeAttemptResult({
         assistantTexts: ["Write completed. Here is the final answer."],
+        attemptUsage: { input: 4, output: 3, total: 7 },
         lastAssistant: finalAssistant,
         currentAttemptAssistant: finalAssistant,
         currentAttemptCompletedAssistant: finalAssistant,
@@ -1130,14 +1149,31 @@ describe("runEmbeddedAgent incomplete-turn safety", () => {
       .mockReturnValueOnce([])
       .mockReturnValueOnce([{ text: "Write completed. Here is the final answer." }]);
 
-    const result = await runEmbeddedAgent({
+    const runParams = {
       ...overflowBaseRunParams,
       provider: "openai",
-      model: "gpt-5.5",
+      model: "base-model",
       runId: "run-tool-use-terminal-continuation",
+    };
+    bindEmbeddedRunAccountingObservers(runParams, {
+      onAttemptObserved: onEmbeddedRunAttemptObserved,
     });
+    const result = await runEmbeddedAgent(runParams);
 
     expect(mockedRunEmbeddedAttempt).toHaveBeenCalledTimes(2);
+    expect(onEmbeddedRunAttemptObserved).toHaveBeenCalledOnce();
+    expect(onEmbeddedRunAttemptObserved).toHaveBeenCalledWith(
+      expect.objectContaining({
+        provider: "openai",
+        model: "effective-model",
+        usage: { input: 4, output: 3, total: 7 },
+        assistantTurns: 1,
+        assistantTurnsObserved: true,
+        toolSummary: { calls: 0, tools: [] },
+        toolsObserved: true,
+        codeModeLifecycleObserved: false,
+      }),
+    );
     expect(result.payloads?.[0]?.text).toBe("Write completed. Here is the final answer.");
     const secondCall = runAttemptCall(1);
     expect(secondCall.prompt).toBe(SETTLED_TOOL_TERMINAL_CONTINUATION_INSTRUCTION);
@@ -1227,13 +1263,38 @@ describe("runEmbeddedAgent incomplete-turn safety", () => {
       .mockReturnValueOnce([{ text: "⚠️ 🛠️ Exec failed", isError: true }])
       .mockReturnValueOnce([{ text: failureText }]);
 
-    const result = await runEmbeddedAgent({
+    const onAgentSubmission = vi.fn(() => ({ settle: vi.fn() }));
+    registerAgentHarness({
+      id: "openclaw",
+      label: "OpenClaw embedded agent",
+      supports: () => ({ supported: true, priority: 100 }),
+      runAttempt: async (attempt) => await mockedRunEmbeddedAttempt(attempt),
+      finalizeSettledTurn: async ({ attempt }) => {
+        expect(resolveEmbeddedRunAccountingObservers(attempt)?.onAgentSubmission).toBe(
+          onAgentSubmission,
+        );
+        const finalized = await mockedRunEmbeddedAttempt(attempt);
+        const assistant =
+          finalized.currentAttemptCompletedAssistant ??
+          finalized.currentAttemptAssistant ??
+          finalized.lastAssistant;
+        if (!assistant) {
+          throw new Error("mocked settled-turn finalization returned no assistant message");
+        }
+        return { assistant };
+      },
+    });
+    const runParams = {
       ...overflowBaseRunParams,
       ...runPolicy,
       provider: "openai",
       model: "gpt-5.5",
+      agentHarnessId: "openclaw",
       runId: `run-settled-failed-tool-${runPolicy.trigger}`,
-    });
+    };
+    bindEmbeddedRunAccountingObservers(runParams, { onAgentSubmission });
+
+    const result = await runEmbeddedAgent(runParams);
 
     expect(mockedRunEmbeddedAttempt).toHaveBeenCalledTimes(2);
     expect(result.payloads?.[0]?.text).toBe(failureText);
@@ -1321,17 +1382,21 @@ describe("runEmbeddedAgent incomplete-turn safety", () => {
         }),
       );
     mockedBuildEmbeddedRunPayloads.mockReturnValue([warning]);
-
-    const result = await runEmbeddedAgent({
+    const onOpaqueWork = vi.fn();
+    const runParams = {
       ...overflowBaseRunParams,
       provider: "openai",
       model: "gpt-5.5",
       runId: "run-failed-tool-finalization-fallback",
-    });
+    };
+    bindEmbeddedRunAccountingObservers(runParams, { onOpaqueWork });
+
+    const result = await runEmbeddedAgent(runParams);
 
     expect(mockedRunEmbeddedAttempt).toHaveBeenCalledTimes(2);
     expect(result.payloads?.[0]).toEqual(warning);
     expectWarnMessageWith("settled-turn finalization failed closed");
+    expect(onOpaqueWork).toHaveBeenCalledWith("settled_finalization_failed");
   });
 
   it("preserves the incomplete-turn failure when the selected harness cannot finalize safely", async () => {

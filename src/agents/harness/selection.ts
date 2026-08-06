@@ -19,6 +19,10 @@ import {
   runWithAgentRingZeroTools,
 } from "../agent-tools.ring-zero-context.js";
 import { resolveConversationCapabilityProfile } from "../conversation-capability-profile.js";
+import {
+  copyEmbeddedRunAccountingObservers,
+  resolveEmbeddedRunAccountingObservers,
+} from "../embedded-agent-runner/run/accounting-observers.js";
 import type {
   EmbeddedRunAttemptParams,
   EmbeddedRunAttemptResult,
@@ -480,12 +484,14 @@ export async function runAgentHarnessSettledTurnFinalization(
   if (internalParams.systemAgentTool && !isSystemAgentOnlyAllowlist(internalParams.toolsAllow)) {
     throw new Error('OpenClaw host authority requires toolsAllow: ["openclaw"]');
   }
-  const pluginParams = withoutInternalHarnessAuthority({
+  const operationParams = copyEmbeddedRunAccountingObservers(params, {
     ...internalParams,
     operation: "settled-tool-finalization",
-  });
+  } as const);
   const attemptParams =
-    harness.id === "openclaw" ? pluginParams : preparePluginHarnessParams(pluginParams);
+    harness.id === "openclaw"
+      ? withoutSystemAgentToolAuthority(operationParams)
+      : preparePluginHarnessParams(withoutInternalHarnessAuthority(operationParams));
   return runAgentHarnessOperation(harness, params, () =>
     runWithAgentRingZeroTools([], () =>
       runAgentHarnessLifecycleFinalization(harness, attemptParams, () =>
@@ -503,6 +509,9 @@ async function runSelectedAgentHarnessAttempt(
   };
   const selection = selectPreparedAgentHarness(params);
   const harness = selection.harness;
+  resolveEmbeddedRunAccountingObservers(params)?.onRuntimeSelected?.(
+    harness.id === "openclaw" ? "embedded" : "native",
+  );
   if (internalParams.systemAgentTool && !isSystemAgentOnlyAllowlist(internalParams.toolsAllow)) {
     throw new Error('OpenClaw host authority requires toolsAllow: ["openclaw"]');
   }
@@ -513,7 +522,6 @@ async function runSelectedAgentHarnessAttempt(
         ),
       ]
     : [];
-  const pluginParams = withoutInternalHarnessAuthority(internalParams);
   logAgentHarnessSelection(selection, {
     provider: params.provider,
     modelId: params.modelId,
@@ -525,7 +533,9 @@ async function runSelectedAgentHarnessAttempt(
       // Resolve plugin policy after entering the host scope. Ring-zero tools are
       // trusted setup authority and must survive ordinary deny-all policy.
       const attemptParams =
-        harness.id === "openclaw" ? pluginParams : preparePluginHarnessParams(pluginParams);
+        harness.id === "openclaw"
+          ? withoutSystemAgentToolAuthority(internalParams)
+          : preparePluginHarnessParams(withoutInternalHarnessAuthority(internalParams));
       return runAgentHarnessLifecycleAttempt(harness, attemptParams);
     }),
   );
@@ -585,11 +595,21 @@ function isSystemAgentOnlyAllowlist(toolsAllow: readonly string[] | undefined): 
 function withoutInternalHarnessAuthority(
   params: EmbeddedRunAttemptParams & { systemAgentTool?: SystemAgentToolOptions },
 ): EmbeddedRunAttemptParams {
-  if (!Object.hasOwn(params, "systemAgentTool")) {
+  if (!Object.hasOwn(params, "systemAgentTool") && !resolveEmbeddedRunAccountingObservers(params)) {
     return params;
   }
   const { systemAgentTool: _systemAgentTool, ...pluginParams } = params;
   return pluginParams;
+}
+
+function withoutSystemAgentToolAuthority(
+  params: EmbeddedRunAttemptParams & { systemAgentTool?: SystemAgentToolOptions },
+): EmbeddedRunAttemptParams {
+  if (!Object.hasOwn(params, "systemAgentTool")) {
+    return params;
+  }
+  const { systemAgentTool: _systemAgentTool, ...hostParams } = params;
+  return copyEmbeddedRunAccountingObservers(params, hostParams);
 }
 
 function preparePluginHarnessParams(params: EmbeddedRunAttemptParams): EmbeddedRunAttemptParams {

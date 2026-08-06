@@ -21,6 +21,7 @@ import {
   type AgentTool,
   type ThinkingLevel,
 } from "../runtime/index.js";
+import { copyAgentSessionAccounting } from "./agent-session-accounting.js";
 import type { AgentSessionConfig } from "./agent-session-types.js";
 import { AgentSession, type AgentSessionWriteLockRunner } from "./agent-session.js";
 import { formatNoModelsAvailableMessage } from "./auth-guidance.js";
@@ -546,7 +547,7 @@ async function createAgentSessionImpl(
     sessionManager.appendThinkingLevelChange(thinkingLevel);
   }
 
-  const session = new AgentSession({
+  const sessionConfig: AgentSessionConfig = {
     agent,
     sessionManager,
     settingsManager,
@@ -562,7 +563,9 @@ async function createAgentSessionImpl(
     sessionStartEvent: options.sessionStartEvent,
     withSessionWriteLock: options.withSessionWriteLock,
     contextOverflowRecoveryOwner: internalOptions.contextOverflowRecoveryOwner,
-  });
+  };
+  copyAgentSessionAccounting(options, sessionConfig);
+  const session = new AgentSession(sessionConfig);
   const extensionsResult = resourceLoader.getExtensions();
 
   return {
