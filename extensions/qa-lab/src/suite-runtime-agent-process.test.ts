@@ -60,6 +60,17 @@ function createMockEmitter() {
 
 function createSpawnedProcess(params: { pid?: number } = {}) {
   const child = createMockEmitter() as MockChildProcess;
+  const emit = child.emit.bind(child);
+  let exited = false;
+  child.emit = (eventName, ...args) => {
+    if (eventName === "exit") {
+      exited = true;
+    } else if (eventName === "close" && !exited) {
+      exited = true;
+      emit("exit", ...args);
+    }
+    return emit(eventName, ...args);
+  };
   child.pid = params.pid;
   child.stdout = createMockEmitter();
   child.stderr = createMockEmitter();
@@ -173,7 +184,16 @@ describe("qa suite runtime agent process helpers", () => {
   });
 
   it.runIf(process.platform !== "win32")("kills timed-out qa cli process groups", async () => {
-    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+    let processGroupAlive = true;
+    const killSpy = vi.spyOn(process, "kill").mockImplementation((pid, signal) => {
+      if (pid === -12345 && signal === "SIGKILL") {
+        processGroupAlive = false;
+      }
+      if (pid === -12345 && signal === 0 && !processGroupAlive) {
+        throw Object.assign(new Error("gone"), { code: "ESRCH" });
+      }
+      return true;
+    });
     vi.useFakeTimers();
     try {
       const child = createSpawnedProcess({ pid: 12345 });
@@ -198,6 +218,8 @@ describe("qa suite runtime agent process helpers", () => {
         ),
       );
       await vi.advanceTimersByTimeAsync(1);
+      child.emit("exit", null, "SIGKILL");
+      child.emit("close", null, "SIGKILL");
 
       const error = await errorPromise;
       expect(error).toMatchObject({ code: "qa_cli_timeout" });
