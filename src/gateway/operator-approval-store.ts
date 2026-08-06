@@ -54,6 +54,8 @@ export type OperatorApprovalSource = {
   sessionKey: string | null;
   sessionId: string | null;
   runId: string | null;
+  contextId: string | null;
+  executionId: string | null;
   toolCallId: string | null;
   toolName: string | null;
 };
@@ -365,6 +367,8 @@ function decodeOperatorApprovalRow(row: OperatorApprovalRow): OperatorApprovalRe
   const decision = row.decision as OperatorApprovalDecision | null;
   const terminalReason = row.terminal_reason as OperatorApprovalTerminalReason | null;
   const resolverKind = row.resolver_kind as OperatorApprovalResolverKind | null;
+  const sourceContextId = normalizeString(row.source_context_id);
+  const sourceExecutionId = normalizeString(row.source_execution_id);
   if (
     !presentation ||
     !isWellFormedApprovalId(row.approval_id) ||
@@ -391,7 +395,12 @@ function decodeOperatorApprovalRow(row: OperatorApprovalRow): OperatorApprovalRe
     (row.requested_by_device_token_auth !== 0 && row.requested_by_device_token_auth !== 1) ||
     (decision !== null && !OPERATOR_APPROVAL_DECISIONS.has(decision)) ||
     (terminalReason !== null && !OPERATOR_APPROVAL_TERMINAL_REASONS.has(terminalReason)) ||
-    (resolverKind !== null && !OPERATOR_APPROVAL_RESOLVER_KINDS.has(resolverKind))
+    (resolverKind !== null && !OPERATOR_APPROVAL_RESOLVER_KINDS.has(resolverKind)) ||
+    (sourceContextId === null) !== (sourceExecutionId === null) ||
+    (sourceContextId !== null && sourceContextId.length > 256) ||
+    (sourceExecutionId !== null && sourceExecutionId.length > 256) ||
+    row.source_context_id !== sourceContextId ||
+    row.source_execution_id !== sourceExecutionId
   ) {
     return null;
   }
@@ -423,6 +432,8 @@ function decodeOperatorApprovalRow(row: OperatorApprovalRow): OperatorApprovalRe
       sessionKey: row.source_session_key,
       sessionId: row.source_session_id,
       runId: row.source_run_id,
+      contextId: sourceContextId,
+      executionId: sourceExecutionId,
       toolCallId: row.source_tool_call_id,
       toolName: row.source_tool_name,
     },
@@ -587,6 +598,8 @@ function inputMatchesExistingRow(
     row.source_session_key === normalizeString(source.sessionKey) &&
     row.source_session_id === normalizeString(source.sessionId) &&
     row.source_run_id === normalizeString(source.runId) &&
+    row.source_context_id === normalizeString(source.contextId) &&
+    row.source_execution_id === normalizeString(source.executionId) &&
     row.source_tool_call_id === normalizeString(source.toolCallId) &&
     row.source_tool_name === normalizeString(source.toolName) &&
     row.audience_session_keys_json === serialized.audienceSessionKeysJson &&
@@ -625,6 +638,17 @@ export function insertOperatorApproval(params: {
     );
   }
   const audienceSessionKeysJson = JSON.stringify(audienceSessionKeys);
+  const source = input.source ?? {};
+  const sourceContextId = normalizeString(source.contextId);
+  const sourceExecutionId = normalizeString(source.executionId);
+  if ((sourceContextId === null) !== (sourceExecutionId === null)) {
+    throw new Error(
+      "operator approval execution identity must bind context and execution together",
+    );
+  }
+  if ((sourceContextId?.length ?? 0) > 256 || (sourceExecutionId?.length ?? 0) > 256) {
+    throw new Error("operator approval execution identity exceeds its bounded contract");
+  }
   const serialized = {
     presentationJson,
     reviewerDeviceIdsJson,
@@ -644,7 +668,6 @@ export function insertOperatorApproval(params: {
     if (hasApprovalLocatorNamespaceConflict({ database, id, resolutionRef })) {
       return { outcome: "conflict" };
     }
-    const source = input.source ?? {};
     const result = executeSqliteQuerySync(
       database.db,
       stateDb
@@ -663,6 +686,8 @@ export function insertOperatorApproval(params: {
           source_session_key: normalizeString(source.sessionKey),
           source_session_id: normalizeString(source.sessionId),
           source_run_id: normalizeString(source.runId),
+          source_context_id: sourceContextId,
+          source_execution_id: sourceExecutionId,
           source_tool_call_id: normalizeString(source.toolCallId),
           source_tool_name: normalizeString(source.toolName),
           audience_session_keys_json: audienceSessionKeysJson,

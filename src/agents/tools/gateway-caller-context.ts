@@ -1,11 +1,17 @@
 // Ambient trusted caller context for model-mediated Gateway tool calls.
 import { AsyncLocalStorage } from "node:async_hooks";
+import {
+  getExecutionIdentityAdmissionScope,
+  parseExecutionIdentityAdmissionToken,
+  type ExecutionIdentityAdmissionToken,
+} from "../../audit/execution-identity-admission.js";
 import { copyAgentToolMetadata } from "../agent-tool-metadata.js";
 import type { AnyAgentTool } from "./common.js";
 
 type GatewayToolCallerIdentity = {
   agentId: string;
   sessionKey: string;
+  executionIdentity?: ExecutionIdentityAdmissionToken;
   /** Host-signed capability for the scheduled run's existing self-management surface. */
   cronSelfManagementJobId?: string;
   // Trusted run context, carried separately from model-authored tool arguments.
@@ -43,6 +49,9 @@ export async function withGatewayToolCallerIdentity<T>(
     {
       agentId: identity.agentId.trim(),
       sessionKey: identity.sessionKey.trim(),
+      ...(identity.executionIdentity
+        ? { executionIdentity: parseExecutionIdentityAdmissionToken(identity.executionIdentity) }
+        : {}),
       ...(identity.cronSelfManagementJobId?.trim()
         ? { cronSelfManagementJobId: identity.cronSelfManagementJobId.trim() }
         : {}),
@@ -80,11 +89,13 @@ export function createGatewayToolCallerWrapper(
   agentId: string | undefined,
   source: GatewayToolCallerSource | undefined,
 ): (tool: AnyAgentTool) => AnyAgentTool {
+  const executionIdentity = getExecutionIdentityAdmissionScope()?.token;
   const identity =
     agentId && source?.agentSessionKey?.trim()
       ? {
           agentId,
           sessionKey: source.agentSessionKey.trim(),
+          ...(executionIdentity ? { executionIdentity } : {}),
           turnSourceChannel: source.agentChannel,
           turnSourceTo: source.currentMessagingTarget ?? source.currentChannelId ?? source.agentTo,
           turnSourceAccountId: source.agentAccountId,

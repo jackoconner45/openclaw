@@ -5,6 +5,7 @@
  */
 import { Type } from "typebox";
 import { isAcpRuntimeSpawnAvailable } from "../../acp/runtime/availability.js";
+import type { ExecutionIdentityAdmissionToken } from "../../audit/execution-identity-admission.js";
 import {
   resolveThreadBindingSpawnPolicy,
   supportsAutomaticThreadBindingSpawn,
@@ -267,6 +268,8 @@ export function createSessionsSpawnTool(
   opts?: {
     agentSessionKey?: string;
     requesterTurnRunId?: string;
+    /** Exact private parent identity; never exposed in the tool schema or result. */
+    parentExecutionIdentity?: ExecutionIdentityAdmissionToken;
     /** Separate key used only for completion routing (registerSubagentRun requesterSessionKey). */
     completionOwnerKey?: string;
     agentChannel?: GatewayMessageChannel;
@@ -502,6 +505,7 @@ export function createSessionsSpawnTool(
           {
             agentSessionKey: opts?.agentSessionKey,
             requesterTurnRunId: opts?.requesterTurnRunId,
+            parentExecutionIdentity: opts?.parentExecutionIdentity,
             completionOwnerKey: opts?.completionOwnerKey,
             requesterAgentIdOverride: opts?.requesterAgentIdOverride,
             agentChannel: opts?.agentChannel,
@@ -566,6 +570,7 @@ export function createSessionsSpawnTool(
         {
           agentSessionKey: opts?.agentSessionKey,
           requesterTurnRunId: opts?.requesterTurnRunId,
+          parentExecutionIdentity: opts?.parentExecutionIdentity,
           completionOwnerKey: opts?.completionOwnerKey,
           agentChannel: opts?.agentChannel,
           agentAccountId: opts?.agentAccountId,

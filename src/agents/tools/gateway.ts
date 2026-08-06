@@ -225,7 +225,15 @@ const AGENT_RUNTIME_IDENTITY_METHODS = new Set<string>([
   "cron.runs",
 ]);
 
-const OPTIONAL_LOCAL_AGENT_RUNTIME_IDENTITY_METHODS = new Set<string>(["node.invoke"]);
+const APPROVAL_IDENTITY_BINDING_METHODS = new Set<string>([
+  "exec.approval.request",
+  "plugin.approval.request",
+]);
+
+const OPTIONAL_LOCAL_AGENT_RUNTIME_IDENTITY_METHODS = new Set<string>([
+  "node.invoke",
+  ...APPROVAL_IDENTITY_BINDING_METHODS,
+]);
 
 function resolveApprovalRuntimeTokenForGatewayTool(params: {
   method: string;
@@ -355,6 +363,9 @@ async function resolveAgentRuntimeIdentityTokenForGatewayTool(params: {
     if (params.required) {
       throw new Error("trusted agent runtime identity required for this gateway call");
     }
+    return undefined;
+  }
+  if (APPROVAL_IDENTITY_BINDING_METHODS.has(params.method) && !identity.executionIdentity) {
     return undefined;
   }
   const hasGatewayUrlOverride = trimToUndefined(params.opts.gatewayUrl) !== undefined;
@@ -564,10 +575,16 @@ export async function callGatewayTool<T = Record<string, unknown>>(
       });
     }
     if (agentRuntimeIdentityToken && isStaleGatewayAgentRuntimeIdentityRejection(error)) {
-      if (method === "node.invoke" && extra?.requireAgentRuntimeIdentity !== true) {
+      if (
+        OPTIONAL_LOCAL_AGENT_RUNTIME_IDENTITY_METHODS.has(method) &&
+        extra?.requireAgentRuntimeIdentity !== true
+      ) {
         return await callGateway<T>({
           ...callOptions,
-          params: stripNodeInvokeTurnSource(callOptions.params),
+          params:
+            method === "node.invoke"
+              ? stripNodeInvokeTurnSource(callOptions.params)
+              : callOptions.params,
           agentRuntimeIdentityToken: undefined,
         });
       }

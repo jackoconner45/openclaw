@@ -1,0 +1,32 @@
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
+import { isExecutionIdentityCollectionEnabled } from "../../audit/audit-config.js";
+import { parseExecutionIdentityAdmissionToken } from "../../audit/execution-identity-admission.js";
+import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import type { ExecApprovalRecord } from "../exec-approval-manager.js";
+import type { GatewayClient } from "./types.js";
+
+/** Binds only Gateway-verified execution identity at the approval creation boundary. */
+export function bindApprovalExecutionIdentity<TPayload>(params: {
+  cfg: OpenClawConfig;
+  client?: GatewayClient | null;
+  record: ExecApprovalRecord<TPayload>;
+}): void {
+  params.record.sourceExecutionIdentity = undefined;
+  const raw = params.client?.internal?.agentRuntimeIdentity?.executionIdentity;
+  if (!raw || !isExecutionIdentityCollectionEnabled(params.cfg)) {
+    return;
+  }
+  try {
+    const identity = parseExecutionIdentityAdmissionToken(raw);
+    const requestRunId = normalizeOptionalString(
+      typeof params.record.request === "object" && params.record.request !== null
+        ? (params.record.request as Record<string, unknown>).runId
+        : undefined,
+    );
+    if (!requestRunId || requestRunId === identity.runId) {
+      params.record.sourceExecutionIdentity = identity;
+    }
+  } catch {
+    // Invalid synthetic client state is never authoritative.
+  }
+}

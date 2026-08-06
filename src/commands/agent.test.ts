@@ -18,6 +18,7 @@ import * as modelSelectionModule from "../agents/model-selection.js";
 import { loadPreparedModelCatalog } from "../agents/prepared-model-catalog.js";
 import { isAgentRunRestartAbortReason } from "../agents/run-termination.js";
 import { ensureAgentWorkspace } from "../agents/workspace.js";
+import { getExecutionIdentityAdmissionScope } from "../audit/execution-identity-admission.js";
 import { BASE_THINKING_LEVELS } from "../auto-reply/thinking.shared.js";
 import * as runtimeSnapshotModule from "../config/runtime-snapshot.js";
 import { parseSqliteSessionFileMarker } from "../config/sessions/legacy-sqlite-marker.js";
@@ -405,6 +406,52 @@ beforeEach(() => {
 });
 
 describe("agentCommand", () => {
+  it.each([
+    ["local", false],
+    ["gateway ingress", true],
+  ] as const)(
+    "enters one enabled post-prepare identity scope for %s execution",
+    async (_name, ingress) => {
+      await withTempHome(async (home) => {
+        const storePath = path.join(home, "sessions.json");
+        const cfg = mockConfig(home, storePath);
+        cfg.logging = { audit: { enabled: true, executionIdentity: true } };
+        const observed: Array<ReturnType<typeof getExecutionIdentityAdmissionScope>> = [];
+        vi.mocked(runEmbeddedAgent).mockImplementationOnce(async () => {
+          observed.push(getExecutionIdentityAdmissionScope());
+          await Promise.resolve();
+          observed.push(getExecutionIdentityAdmissionScope());
+          return createDefaultAgentResult();
+        });
+
+        if (ingress) {
+          await agentCommandFromIngress(
+            {
+              message: "scope gateway run",
+              agentId: "main",
+              runId: "authoritative-run",
+              allowModelOverride: false,
+            },
+            runtime,
+          );
+        } else {
+          await agentCommand(
+            { message: "scope local run", agentId: "main", runId: "authoritative-run" },
+            runtime,
+          );
+        }
+
+        expect(observed).toHaveLength(2);
+        expect(observed[0]).toBe(observed[1]);
+        expect(observed[0]).toMatchObject({
+          retryOnly: false,
+          token: { runId: "authoritative-run" },
+        });
+        expect(getExecutionIdentityAdmissionScope()).toBeUndefined();
+      });
+    },
+  );
+
   it("passes one-shot OpenAI model overrides to harness plugin preparation", async () => {
     await withTempHome(async (home) => {
       const storePath = path.join(home, "sessions.json");
@@ -450,8 +497,14 @@ describe("agentCommand", () => {
   it("strips private recovery identity from runtime-shaped public ingress", async () => {
     await withTempHome(async (home) => {
       const store = path.join(home, "sessions.json");
-      mockConfig(home, store);
+      const cfg = mockConfig(home, store);
+      cfg.logging = { audit: { enabled: true, executionIdentity: true } };
       const record = vi.spyOn(executionIdentity, "record").mockImplementation(() => undefined);
+      let observedContextId: string | undefined;
+      vi.mocked(runEmbeddedAgent).mockImplementationOnce(async () => {
+        observedContextId = getExecutionIdentityAdmissionScope()?.token.contextId;
+        return createDefaultAgentResult();
+      });
       const inheritedAdmission = {
         token: {
           tokenVersion: 1 as const,
@@ -494,8 +547,11 @@ describe("agentCommand", () => {
         );
 
         expect(record).toHaveBeenCalledWith(
-          expect.objectContaining({ admission: undefined, runId: "public-ingress-run" }),
+          expect.objectContaining({ runId: "public-ingress-run" }),
         );
+        expect(record.mock.calls[0]?.[0]).not.toHaveProperty("admission");
+        expect(observedContextId).not.toBe("forged-context");
+        expect(observedContextId).not.toBe("inherited-context");
       } finally {
         record.mockRestore();
         if (priorDescriptor) {

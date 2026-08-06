@@ -66,6 +66,43 @@ describe("gateway tool runtime identity", () => {
     },
   );
 
+  it("signs the exact private execution identity onto local approval creation", async () => {
+    mocks.callGateway.mockResolvedValueOnce({ id: "approval-1" });
+    const executionIdentity = {
+      tokenVersion: 1 as const,
+      contextId: "context-1",
+      executionId: "execution-1",
+      runId: "run-1",
+      createdAt: 123,
+    };
+
+    await withGatewayToolCallerIdentity(
+      {
+        agentId: "ops",
+        sessionKey: "agent:ops:main",
+        executionIdentity,
+      },
+      async () =>
+        await callGatewayTool("exec.approval.request", {}, { command: "echo ok", runId: "run-1" }),
+    );
+
+    await expect(
+      verifyAgentRuntimeIdentityToken(capturedGatewayCall().agentRuntimeIdentityToken),
+    ).resolves.toMatchObject({ executionIdentity });
+  });
+
+  it("omits approval execution identity when the private carrier is absent", async () => {
+    mocks.callGateway.mockResolvedValueOnce({ id: "approval-1" });
+
+    await withGatewayToolCallerIdentity(
+      { agentId: "ops", sessionKey: "agent:ops:main" },
+      async () =>
+        await callGatewayTool("exec.approval.request", {}, { command: "echo ok", runId: "run-1" }),
+    );
+
+    expect(capturedGatewayCall()).not.toHaveProperty("agentRuntimeIdentityToken");
+  });
+
   it("scopes signed session-spawn authority to its Gateway call", async () => {
     mocks.callGateway.mockResolvedValueOnce({ key: "agent:ops:dashboard:child" });
 

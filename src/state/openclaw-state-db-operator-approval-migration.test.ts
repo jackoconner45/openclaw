@@ -33,6 +33,12 @@ function withoutResolutionRefColumn(sql: string): string {
   return sql.slice(0, resolutionRefStart) + sql.slice(followingColumnStart);
 }
 
+function withoutExecutionIdentityColumns(sql: string): string {
+  return sql
+    .replace("\n  source_context_id TEXT,", "")
+    .replace("\n  source_execution_id TEXT,", "");
+}
+
 function createAlterAppendedLegacyTable(db: DatabaseSync, strict: boolean): void {
   const createSql = withoutResolutionRefColumn(
     strict ? legacyTwoKindCreateSql().replace(/\);$/u, ") STRICT;") : legacyTwoKindCreateSql(),
@@ -100,6 +106,24 @@ describe("repairOperatorApprovalKinds", () => {
     expect(
       db.prepare("SELECT strict FROM pragma_table_list WHERE name = 'operator_approvals'").get(),
     ).toEqual({ strict: 1 });
+    db.close();
+  });
+
+  it("migrates the pre-binding two-kind schema with NULL owner fields", () => {
+    const db = new DatabaseSync(":memory:");
+    db.exec(withoutExecutionIdentityColumns(legacyTwoKindCreateSql()));
+    seedRow(db, "exec");
+
+    expect(repairOperatorApprovalSchema(db)).toEqual([
+      "Migrated shared state operator approvals → OpenClaw system changes",
+    ]);
+    expect(
+      db
+        .prepare(
+          "SELECT approval_id, source_context_id, source_execution_id FROM operator_approvals",
+        )
+        .all(),
+    ).toEqual([{ approval_id: "a1", source_context_id: null, source_execution_id: null }]);
     db.close();
   });
 

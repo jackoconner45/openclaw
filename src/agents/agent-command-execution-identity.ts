@@ -1,10 +1,14 @@
 import { isExecutionIdentityCollectionEnabled } from "../audit/audit-config.js";
 import {
+  createExecutionIdentityAdmissionToken,
   enqueueExecutionIdentityContextAtAdmission,
+  getExecutionIdentityAdmissionScope,
+  parseExecutionIdentityAdmissionToken,
+  runWithExecutionIdentityAdmissionScope,
   type ExecutionIdentityAdmissionFacts,
 } from "../audit/execution-identity-admission.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import type { AgentCommandOpts } from "./command/types.js";
+import type { PreparedAgentCommandExecution } from "./command/prepare.js";
 
 type AgentCommandAdmissionIngress = ExecutionIdentityAdmissionFacts["ingress"];
 
@@ -19,13 +23,16 @@ function systemIngress(boundary: string): AgentCommandAdmissionIngress {
 }
 
 function recordAgentCommandExecutionIdentity(params: {
-  admission?: AgentCommandOpts["executionIdentityAdmission"];
   agentId: string;
   cfg: OpenClawConfig;
   ingress: AgentCommandAdmissionIngress;
   runId: string;
   runtimeKind: ExecutionIdentityAdmissionFacts["runtime"]["kind"];
 }): void {
+  const admission = getExecutionIdentityAdmissionScope();
+  if (!admission || !isExecutionIdentityCollectionEnabled(params.cfg)) {
+    return;
+  }
   // Session work admission owns these facts. Queue acceptance is not persistence;
   // audit loss must never become run loss.
   enqueueExecutionIdentityContextAtAdmission(
@@ -36,16 +43,37 @@ function recordAgentCommandExecutionIdentity(params: {
       runtime: { kind: params.runtimeKind },
     },
     {
-      enabled: isExecutionIdentityCollectionEnabled(params.cfg),
-      ...(params.admission
-        ? { token: params.admission.token, retryOnly: params.admission.retryOnly }
-        : {}),
+      enabled: true,
+      token: admission.token,
+      retryOnly: admission.retryOnly,
     },
+  );
+}
+
+async function runPreparedAgentCommandWithExecutionIdentity<TResult>(params: {
+  prepared: PreparedAgentCommandExecution;
+  run: (prepared: PreparedAgentCommandExecution) => Promise<TResult>;
+}): Promise<TResult> {
+  const { executionIdentityAdmission, ...sanitizedOpts } = params.prepared.opts;
+  const prepared = { ...params.prepared, opts: sanitizedOpts };
+  if (!isExecutionIdentityCollectionEnabled(prepared.cfg)) {
+    return await params.run(prepared);
+  }
+  const token = executionIdentityAdmission
+    ? parseExecutionIdentityAdmissionToken(executionIdentityAdmission.token)
+    : createExecutionIdentityAdmissionToken(prepared.runId);
+  if (token.runId !== prepared.runId) {
+    throw new Error("execution identity admission token disagrees with the prepared run");
+  }
+  return await runWithExecutionIdentityAdmissionScope(
+    { token, retryOnly: executionIdentityAdmission?.retryOnly === true },
+    () => params.run(prepared),
   );
 }
 
 export const executionIdentity = {
   localIngress: LOCAL_CLI_ADMISSION_INGRESS,
   record: recordAgentCommandExecutionIdentity,
+  runPrepared: runPreparedAgentCommandWithExecutionIdentity,
   systemIngress,
 };

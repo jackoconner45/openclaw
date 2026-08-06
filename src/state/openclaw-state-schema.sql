@@ -342,6 +342,8 @@ CREATE TABLE IF NOT EXISTS operator_approvals (
   source_session_key TEXT,
   source_session_id TEXT,
   source_run_id TEXT,
+  source_context_id TEXT,
+  source_execution_id TEXT,
   source_tool_call_id TEXT,
   source_tool_name TEXT,
   audience_session_keys_json TEXT NOT NULL,

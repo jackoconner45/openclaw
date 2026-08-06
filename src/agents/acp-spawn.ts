@@ -7,6 +7,7 @@ import {
   type AcpSpawnRuntimeCloseHandle,
 } from "../acp/control-plane/spawn.js";
 import { isAcpEnabledByPolicy, resolveAcpAgentPolicyError } from "../acp/policy.js";
+import type { ExecutionIdentityAdmissionToken } from "../audit/execution-identity-admission.js";
 import { getRuntimeConfig } from "../config/config.js";
 import { resolveStorePath } from "../config/sessions/paths.js";
 import {
@@ -123,6 +124,8 @@ type SpawnAcpParams = {
 export type SpawnAcpContext = {
   agentSessionKey?: string;
   requesterTurnRunId?: string;
+  /** Exact private parent identity for the future lineage owner. */
+  parentExecutionIdentity?: ExecutionIdentityAdmissionToken;
   completionOwnerKey?: string;
   requesterAgentIdOverride?: string;
   agentChannel?: string;

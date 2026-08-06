@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { GATEWAY_CLIENT_IDS } from "../../../packages/gateway-protocol/src/client-info.js";
 import { closeOpenClawStateDatabaseForTest } from "../../state/openclaw-state-db.js";
 import { ExecApprovalManager } from "../exec-approval-manager.js";
+import { getOperatorApprovalDetailed } from "../operator-approval-store.js";
 import {
   bindApprovalReviewerDeviceIds,
   handleApprovalResolve,
@@ -32,6 +33,13 @@ function createApprovalClient(params: {
   deviceId?: string;
   scopes?: string[];
   approvalRuntime?: boolean;
+  executionIdentity?: {
+    tokenVersion: 1;
+    contextId: string;
+    executionId: string;
+    runId: string;
+    createdAt: number;
+  };
 }): GatewayClient {
   return {
     connId: params.connId,
@@ -40,7 +48,23 @@ function createApprovalClient(params: {
       device: params.deviceId ? { id: params.deviceId } : undefined,
       scopes: params.scopes ?? ["operator.approvals"],
     },
-    ...(params.approvalRuntime ? { internal: { approvalRuntime: true } } : {}),
+    ...(params.approvalRuntime || params.executionIdentity
+      ? {
+          internal: {
+            ...(params.approvalRuntime ? { approvalRuntime: true as const } : {}),
+            ...(params.executionIdentity
+              ? {
+                  agentRuntimeIdentity: {
+                    kind: "agentRuntime" as const,
+                    agentId: "main",
+                    sessionKey: "agent:main:main",
+                    executionIdentity: params.executionIdentity,
+                  },
+                }
+              : {}),
+          },
+        }
+      : {}),
   } as GatewayClient;
 }
 
@@ -1677,6 +1701,111 @@ describe("handlePendingApprovalRequest", () => {
       fs.rmSync(tempDir, { force: true, recursive: true });
     }
   });
+
+  it.each([
+    { name: "exact", enabled: true, requestRunId: "run-1", trusted: true, expectedBound: true },
+    {
+      name: "plugin-style",
+      enabled: true,
+      requestRunId: undefined,
+      trusted: true,
+      expectedBound: true,
+    },
+    {
+      name: "mismatch",
+      enabled: true,
+      requestRunId: "run-other",
+      trusted: true,
+      expectedBound: false,
+    },
+    {
+      name: "disabled",
+      enabled: false,
+      requestRunId: "run-1",
+      trusted: true,
+      expectedBound: false,
+    },
+    {
+      name: "ordinary-rpc",
+      enabled: true,
+      requestRunId: "run-1",
+      trusted: false,
+      expectedBound: false,
+    },
+  ])(
+    "persists $name execution identity only from enabled trusted matching runtime state",
+    ({ enabled, requestRunId, trusted, expectedBound, name }) => {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `openclaw-approval-binding-${name}-`));
+      const databaseOptions = { path: path.join(tempDir, "state.sqlite") };
+      const manager = new ExecApprovalManager({
+        approvalKind: "exec",
+        persistence: { runtimeEpoch: "binding-test", databaseOptions },
+      });
+      const request = {
+        command: "echo safe",
+        ...(requestRunId ? { runId: requestRunId } : {}),
+      };
+      const record = manager.create(request, 60_000, `binding-${name}`);
+      const executionIdentity = {
+        tokenVersion: 1 as const,
+        contextId: "context-1",
+        executionId: "execution-1",
+        runId: "run-1",
+        createdAt: 1,
+      };
+      if (!expectedBound) {
+        record.sourceExecutionIdentity = executionIdentity;
+      }
+      try {
+        const decision = registerPendingApprovalRecord({
+          manager,
+          record,
+          timeoutMs: 60_000,
+          respond: vi.fn(),
+          context: {
+            getRuntimeConfig: () => ({
+              logging: { audit: { enabled, executionIdentity: enabled } },
+            }),
+          } as GatewayRequestContext,
+          client: trusted
+            ? createApprovalClient({
+                connId: "conn-agent",
+                clientId: GATEWAY_CLIENT_IDS.GATEWAY_CLIENT,
+                executionIdentity,
+              })
+            : createApprovalClient({
+                connId: "conn-ordinary",
+                clientId: GATEWAY_CLIENT_IDS.CONTROL_UI,
+              }),
+        });
+        expect(decision).toBeDefined();
+        const persisted = getOperatorApprovalDetailed({
+          id: record.id,
+          nowMs: record.createdAtMs,
+          databaseOptions,
+        });
+        expect(persisted).toMatchObject({
+          outcome: "found",
+          record: {
+            source: expectedBound
+              ? {
+                  runId: "run-1",
+                  contextId: "context-1",
+                  executionId: "execution-1",
+                }
+              : {
+                  runId: requestRunId ?? null,
+                  contextId: null,
+                  executionId: null,
+                },
+          },
+        });
+      } finally {
+        closeOpenClawStateDatabaseForTest();
+        fs.rmSync(tempDir, { force: true, recursive: true });
+      }
+    },
+  );
 
   it("sanitizes a no-route storage failure while failing the waiter closed", async () => {
     hasApprovalTurnSourceRouteMock.mockReturnValueOnce(false);

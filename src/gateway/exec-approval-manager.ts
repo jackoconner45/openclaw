@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import { expectDefined } from "@openclaw/normalization-core";
 import { resolveExpiresAtMsFromDurationMs } from "@openclaw/normalization-core/number-coercion";
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
+import type { ExecutionIdentityAdmissionToken } from "../audit/execution-identity-admission.js";
 import { buildApprovalPresentation } from "../infra/approval-presentation.js";
 import { buildApprovalResolutionRef } from "../infra/approval-resolution-ref.js";
 import type {
@@ -86,6 +87,8 @@ export type ExecApprovalRecord<TPayload = ExecApprovalRequestPayload> = {
   requestedByClientId?: string | null;
   requestedByDeviceTokenAuth?: boolean;
   approvalReviewerDeviceIds?: string[];
+  /** Verified private execution owner; never projected into approval events. */
+  sourceExecutionIdentity?: ExecutionIdentityAdmissionToken;
   resolvedAtMs?: number;
   decision?: ExecApprovalDecision;
   consumedDecision?: ExecApprovalDecision;
@@ -171,12 +174,17 @@ function readRequestString(request: unknown, key: string): string | null {
   return typeof value === "string" && value.trim() ? value.trim() : null;
 }
 
-function resolveApprovalSource(request: unknown): OperatorApprovalSource {
+function resolveApprovalSource(
+  request: unknown,
+  executionIdentity?: ExecutionIdentityAdmissionToken,
+): OperatorApprovalSource {
   return {
     agentId: readRequestString(request, "agentId"),
     sessionKey: readRequestString(request, "sessionKey"),
     sessionId: readRequestString(request, "sessionId"),
-    runId: readRequestString(request, "runId"),
+    runId: executionIdentity?.runId ?? readRequestString(request, "runId"),
+    contextId: executionIdentity?.contextId ?? null,
+    executionId: executionIdentity?.executionId ?? null,
     toolCallId: readRequestString(request, "toolCallId"),
     toolName: readRequestString(request, "toolName"),
   };
@@ -297,7 +305,7 @@ export class ExecApprovalManager<TPayload = ExecApprovalRequestPayload> {
 
     let insertedRecord: OperatorApprovalRecord | null = null;
     if (persistence) {
-      const source = resolveApprovalSource(record.request);
+      const source = resolveApprovalSource(record.request, record.sourceExecutionIdentity);
       let audienceSessionKeys: string[] = [];
       if (source.sessionKey) {
         // The injected resolver owns lineage lookup plus its own agent-scoped
@@ -381,7 +389,7 @@ export class ExecApprovalManager<TPayload = ExecApprovalRequestPayload> {
       return null;
     }
     const status = record.status ?? (record.resolvedAtMs === undefined ? "pending" : "denied");
-    const source = resolveApprovalSource(record.request);
+    const source = resolveApprovalSource(record.request, record.sourceExecutionIdentity);
     return {
       id: record.id,
       resolutionRef: buildApprovalResolutionRef({

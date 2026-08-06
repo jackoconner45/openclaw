@@ -1183,6 +1183,37 @@ describe("sessions_spawn tool", () => {
     expect(hoisted.spawnAcpDirectMock).not.toHaveBeenCalled();
   });
 
+  it("passes one private parent token to embedded and ACP producers without schema exposure", async () => {
+    registerAcpBackendForTest();
+    const parentExecutionIdentity = {
+      tokenVersion: 1 as const,
+      contextId: "parent-context",
+      executionId: "parent-execution",
+      runId: "parent-run",
+      createdAt: 123,
+    };
+    const tool = createSessionsSpawnTool({
+      agentSessionKey: "agent:main:main",
+      parentExecutionIdentity,
+    });
+
+    const embeddedResult = await tool.execute("embedded", { task: "embedded child" });
+    const acpResult = await tool.execute("acp", { task: "ACP child", runtime: "acp" });
+
+    expect(mockCallArg(hoisted.spawnSubagentDirectMock, 0, 1, "spawnSubagentDirect")).toMatchObject(
+      {
+        parentExecutionIdentity,
+      },
+    );
+    expect(mockCallArg(hoisted.spawnAcpDirectMock, 0, 1, "spawnAcpDirect")).toMatchObject({
+      parentExecutionIdentity,
+    });
+    expect(
+      (tool.parameters as { properties?: Record<string, unknown> }).properties,
+    ).not.toHaveProperty("parentExecutionIdentity");
+    expect(JSON.stringify([embeddedResult, acpResult])).not.toContain("parent-context");
+  });
+
   it("passes inherited tool denies to subagent spawns", async () => {
     const tool = createSessionsSpawnTool({
       agentSessionKey: "agent:main:main",

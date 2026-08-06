@@ -1,3 +1,4 @@
+import type { ExecutionIdentityAdmissionToken } from "../audit/execution-identity-admission.js";
 import type { FastMode } from "../shared/fast-mode.js";
 import type {
   SpawnSubagentContextMode,
@@ -41,6 +42,8 @@ export type SpawnSubagentParams = {
 export type SpawnSubagentContext = {
   agentSessionKey?: string;
   requesterTurnRunId?: string;
+  /** Exact private parent identity for the future lineage owner. */
+  parentExecutionIdentity?: ExecutionIdentityAdmissionToken;
   /** Separate key used only for completion routing, not sandbox policy. */
   completionOwnerKey?: string;
   agentChannel?: string;

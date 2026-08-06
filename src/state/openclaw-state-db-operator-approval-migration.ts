@@ -1,7 +1,7 @@
 // Doctor-only repair for the operator approval kind constraint.
 import type { DatabaseSync } from "node:sqlite";
 import { runSqliteImmediateTransactionSync } from "../infra/sqlite-transaction.js";
-import { tableExists } from "./openclaw-state-db-schema-helpers.js";
+import { tableExists, tableHasColumn } from "./openclaw-state-db-schema-helpers.js";
 import { OPENCLAW_STATE_SCHEMA_SQL } from "./openclaw-state-schema.js";
 
 const COLUMNS = [
@@ -18,6 +18,8 @@ const COLUMNS = [
   "source_session_key",
   "source_session_id",
   "source_run_id",
+  "source_context_id",
+  "source_execution_id",
   "source_tool_call_id",
   "source_tool_name",
   "audience_session_keys_json",
@@ -117,8 +119,14 @@ function hasExactLegacyOperatorApprovalSchema(db: DatabaseSync): boolean {
     .replace("CREATE TABLE IF NOT EXISTS operator_approvals (", "CREATE TABLE operator_approvals (")
     .replace(/'exec',\s*'plugin',\s*'system-agent'/, "'exec', 'plugin'");
   const normalizedLive = normalizeDdl(live);
-  const alterAppendedStrictLegacy = alterAppendedResolutionRefCreateSql(exactStrictLegacy);
-  return [exactStrictLegacy, alterAppendedStrictLegacy].some((strictLegacy) =>
+  const withoutExecutionIdentity = exactStrictLegacy
+    .replace("\n  source_context_id TEXT,", "")
+    .replace("\n  source_execution_id TEXT,", "");
+  const legacyShapes = [exactStrictLegacy, withoutExecutionIdentity].flatMap((strictLegacy) => [
+    strictLegacy,
+    alterAppendedResolutionRefCreateSql(strictLegacy),
+  ]);
+  return legacyShapes.some((strictLegacy) =>
     [strictLegacy, strictLegacy.replace(/\) STRICT;$/u, ");")]
       .map(normalizeDdl)
       .includes(normalizedLive),
@@ -157,6 +165,12 @@ function repairOperatorApprovalKinds(db: DatabaseSync): boolean {
     return false;
   }
   const columns = COLUMNS.join(", ");
+  const sourceColumns = COLUMNS.map((column) =>
+    (column === "source_context_id" || column === "source_execution_id") &&
+    !tableHasColumn(db, "operator_approvals", column)
+      ? "NULL"
+      : column,
+  ).join(", ");
   // The copy/drop/rename must be atomic: a crash after DROP but before RENAME
   // would strand the rows in the temp table, and the next schema bootstrap would
   // recreate an empty canonical table and abandon them.
@@ -169,7 +183,7 @@ function repairOperatorApprovalKinds(db: DatabaseSync): boolean {
     // CHECK exactly.
     db.exec(`
       INSERT INTO operator_approvals_migration_new (${columns})
-      SELECT ${columns} FROM operator_approvals
+      SELECT ${sourceColumns} FROM operator_approvals
       WHERE typeof(resolution_ref) = 'text'
         AND length(resolution_ref) = 43
         AND resolution_ref NOT GLOB '*[^A-Za-z0-9_-]*';
