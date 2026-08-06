@@ -23,6 +23,8 @@ export function bindApprovalExecutionIdentity<TPayload>(params: {
         ? (params.record.request as Record<string, unknown>).runId
         : undefined,
     );
+    // Bind only when the approval's effective source run agrees with the verified token.
+    // A mismatch is non-authoritative; neither correlation may override the other.
     if (!requestRunId || requestRunId === identity.runId) {
       params.record.sourceExecutionIdentity = identity;
     }

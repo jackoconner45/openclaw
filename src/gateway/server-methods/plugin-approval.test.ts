@@ -26,6 +26,7 @@ function createApprovalContext(
     broadcast: params.broadcast ?? vi.fn(),
     logGateway: createLogGatewayMock(),
     hasExecApprovalClients: params.hasExecApprovalClients ?? (() => true),
+    getRuntimeConfig: () => ({}),
   } as unknown as GatewayRequestHandlerOptions["context"];
 }
 

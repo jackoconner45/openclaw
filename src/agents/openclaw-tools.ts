@@ -1,5 +1,4 @@
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
-import { getExecutionIdentityAdmissionScope } from "../audit/execution-identity-admission.js";
 import type {
   SourceReplyDeliveryMode,
   TaskSuggestionDeliveryMode,
@@ -223,7 +222,6 @@ export function createOpenClawTools(
   } & SpawnedToolContext &
     ModelAwareToolContext,
 ): AnyAgentTool[] {
-  const parentExecutionIdentity = getExecutionIdentityAdmissionScope()?.token;
   const resolvedConfig = options?.config;
   const activeProjectKeys = options?.preparedModelRuntime?.activeProjectKeys ?? [];
   const runtimeSnapshot = getActiveSecretsRuntimeConfigSnapshot();
@@ -661,7 +659,6 @@ export function createOpenClawTools(
           createSessionsSpawnTool({
             agentSessionKey: options?.agentSessionKey,
             requesterTurnRunId: options?.runId,
-            parentExecutionIdentity,
             completionOwnerKey: options?.runSessionKey,
             agentChannel: options?.agentChannel,
             agentAccountId: options?.agentAccountId,
