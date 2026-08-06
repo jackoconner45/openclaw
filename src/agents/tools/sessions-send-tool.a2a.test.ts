@@ -1,9 +1,12 @@
 // sessions_send A2A tests cover announce delivery, same-session replies, delayed
 // reply baselines, and channel target/account routing.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { getExecutionIdentityAdmissionScope } from "../../audit/execution-identity-admission.js";
 import type { CallGatewayOptions } from "../../gateway/call.js";
 import { setActivePluginRegistry } from "../../plugins/runtime.js";
 import { createSessionConversationTestRegistry } from "../../test-utils/session-conversation-registry.js";
+import { executionIdentity } from "../agent-command-execution-identity.js";
+import type { PreparedAgentCommandExecution } from "../command/prepare.js";
 import { readLatestAssistantReplySnapshot, waitForAgentRun } from "../run-wait.js";
 import { runAgentStep } from "./agent-step.js";
 import type { GatewaySessionListRow } from "./sessions-helpers.js";
@@ -116,6 +119,44 @@ describe("runSessionsSendA2AFlow announce delivery", () => {
     const sendParams = sendCall.params as Record<string, unknown>;
     expect(sendParams.channel).toBe("discord");
     expect(sendParams.threadId).toBeUndefined();
+  });
+
+  it("keeps a detached announce step independent from its inherited parent identity", async () => {
+    const prepared = (runId: string) =>
+      ({
+        runId,
+        cfg: { logging: { audit: { enabled: true, executionIdentity: true } } },
+        opts: { message: "test", runId },
+      }) as PreparedAgentCommandExecution;
+    let childExecutionId: string | undefined;
+    vi.mocked(runAgentStep).mockImplementationOnce(
+      async () =>
+        await executionIdentity.runPrepared({
+          prepared: prepared("detached-announce"),
+          run: async () => {
+            childExecutionId = getExecutionIdentityAdmissionScope()?.token.executionId;
+            return "Test announce reply";
+          },
+        }),
+    );
+
+    await executionIdentity.runPrepared({
+      prepared: prepared("parent"),
+      run: async () => {
+        const parent = getExecutionIdentityAdmissionScope();
+        await runSessionsSendA2AFlow({
+          targetSessionKey: "agent:main:discord:group:dev",
+          displayKey: "agent:main:discord:group:dev",
+          message: "Test message",
+          announceTimeoutMs: 10_000,
+          maxPingPongTurns: 0,
+          roundOneReply: "Worker completed successfully",
+        });
+        expect(childExecutionId).toBeTruthy();
+        expect(childExecutionId).not.toBe(parent?.token.executionId);
+        expect(getExecutionIdentityAdmissionScope()).toBe(parent);
+      },
+    });
   });
 
   it("bypasses the announce decider for same-session channel replies", async () => {

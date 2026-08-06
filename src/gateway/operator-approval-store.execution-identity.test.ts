@@ -2,11 +2,14 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { assertSqliteSchemaContains } from "../infra/sqlite-schema-contract.js";
+import { LAZY_ADDITIVE_STATE_TABLES } from "../state/openclaw-state-db-contract.js";
 import {
   closeOpenClawStateDatabaseForTest,
   openOpenClawStateDatabase,
   type OpenClawStateDatabaseOptions,
 } from "../state/openclaw-state-db.js";
+import { OPENCLAW_STATE_SCHEMA_SQL } from "../state/openclaw-state-schema.js";
 import {
   getOperatorApprovalDetailed,
   insertOperatorApproval,
@@ -101,7 +104,7 @@ describe("operator approval execution identity", () => {
     });
   });
 
-  it("rejects partial input and treats a partial persisted row as corrupt", () => {
+  it("rejects partial input and treats a malformed persisted pair as corrupt", () => {
     const databaseOptions = createDatabaseOptions();
     expect(() =>
       insertOperatorApproval({
@@ -117,13 +120,37 @@ describe("operator approval execution identity", () => {
       approval: approval("partial-row", boundSource),
       databaseOptions,
     });
-    openOpenClawStateDatabase(databaseOptions)
-      .db.prepare(
-        "UPDATE operator_approvals SET source_execution_id = NULL WHERE approval_id = 'partial-row'",
-      )
-      .run();
+    const db = openOpenClawStateDatabase(databaseOptions).db;
+    db.exec("PRAGMA ignore_check_constraints = ON;");
+    db.prepare(
+      "UPDATE operator_approval_execution_identities SET source_execution_id = ' ' WHERE approval_id = 'partial-row'",
+    ).run();
+    db.exec("PRAGMA ignore_check_constraints = OFF;");
     expect(
       getOperatorApprovalDetailed({ id: "partial-row", nowMs: 2_000, databaseOptions }),
     ).toEqual({ outcome: "corrupt" });
+  });
+
+  it("keeps the v6 approval table exact and lets the pre-binding schema reopen the database", () => {
+    const databaseOptions = createDatabaseOptions();
+    insertOperatorApproval({
+      approval: approval("downgrade-safe", boundSource),
+      databaseOptions,
+    });
+    const database = openOpenClawStateDatabase(databaseOptions);
+    const columns = database.db
+      .prepare("PRAGMA table_info(operator_approvals)")
+      .all()
+      .map((row) => (row as { name: string }).name);
+    expect(columns).not.toContain("source_context_id");
+    expect(columns).not.toContain("source_execution_id");
+
+    const preBindingSchema = OPENCLAW_STATE_SCHEMA_SQL.replace(
+      /\nCREATE TABLE IF NOT EXISTS operator_approval_execution_identities \([\s\S]*?\n\) STRICT;\n/u,
+      "\n",
+    );
+    assertSqliteSchemaContains(database.db, database.path, preBindingSchema, {
+      allowedMissingTables: LAZY_ADDITIVE_STATE_TABLES,
+    });
   });
 });

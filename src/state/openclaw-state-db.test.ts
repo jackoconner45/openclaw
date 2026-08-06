@@ -3093,68 +3093,6 @@ INSERT INTO macos_port_guardian_records VALUES (4242, 18789, '/usr/bin/ssh', 're
     );
   });
 
-  it("adds nullable execution-owner columns while preserving downgraded named-column access", () => {
-    const stateDir = createTempStateDir();
-    const databasePath = materializeCurrentStateDatabase(stateDir);
-    const { DatabaseSync } = requireNodeSqlite();
-    const legacyDb = new DatabaseSync(databasePath);
-    legacyDb.exec(`
-      ALTER TABLE operator_approvals DROP COLUMN source_context_id;
-      ALTER TABLE operator_approvals DROP COLUMN source_execution_id;
-    `);
-    markStateDatabaseAsV5(legacyDb);
-    legacyDb.close();
-
-    const reopened = openOpenClawStateDatabase({ env: { OPENCLAW_STATE_DIR: stateDir } });
-    const approvalId = "legacy-named-columns";
-    const resolutionRef = buildApprovalResolutionRef({ approvalId, approvalKind: "exec" });
-    reopened.db
-      .prepare(
-        `INSERT INTO operator_approvals (
-          approval_id,
-          resolution_ref,
-          kind,
-          status,
-          presentation_json,
-          requested_by_device_token_auth,
-          reviewer_device_ids_json,
-          source_run_id,
-          audience_session_keys_json,
-          runtime_epoch,
-          created_at_ms,
-          expires_at_ms,
-          updated_at_ms
-        ) VALUES (?, ?, 'exec', 'pending', ?, 0, '[]', 'run-1', '[]', 'legacy-runtime', 1, 1000, 1)`,
-      )
-      .run(
-        approvalId,
-        resolutionRef,
-        JSON.stringify({
-          kind: "exec",
-          commandText: "echo legacy",
-          commandPreview: null,
-          warningText: null,
-          host: "gateway",
-          nodeId: null,
-          agentId: "main",
-          allowedDecisions: ["allow-once", "deny"],
-        }),
-      );
-
-    expect(
-      reopened.db
-        .prepare("SELECT approval_id, source_run_id FROM operator_approvals WHERE approval_id = ?")
-        .get(approvalId),
-    ).toEqual({ approval_id: approvalId, source_run_id: "run-1" });
-    expect(
-      reopened.db
-        .prepare(
-          "SELECT source_context_id, source_execution_id FROM operator_approvals WHERE approval_id = ?",
-        )
-        .get(approvalId),
-    ).toEqual({ source_context_id: null, source_execution_id: null });
-  });
-
   it("migrates operator approvals to accept system-agent records", () => {
     const stateDir = createTempStateDir();
     const options = { env: { OPENCLAW_STATE_DIR: stateDir } };

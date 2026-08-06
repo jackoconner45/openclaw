@@ -944,6 +944,12 @@ export interface OnboardingRecommendations {
   updated_at_ms: number;
 }
 
+export interface OperatorApprovalExecutionIdentities {
+  approval_id: string;
+  source_context_id: string;
+  source_execution_id: string;
+}
+
 export interface OperatorApprovals {
   approval_id: string;
   audience_session_keys_json: string;
@@ -964,8 +970,6 @@ export interface OperatorApprovals {
   reviewer_device_ids_json: string;
   runtime_epoch: string;
   source_agent_id: string | null;
-  source_context_id: string | null;
-  source_execution_id: string | null;
   source_run_id: string | null;
   source_session_id: string | null;
   source_session_key: string | null;
@@ -1623,6 +1627,7 @@ export interface DB {
   node_host_config: NodeHostConfig;
   official_external_plugin_catalog_snapshots: OfficialExternalPluginCatalogSnapshots;
   onboarding_recommendations: OnboardingRecommendations;
+  operator_approval_execution_identities: OperatorApprovalExecutionIdentities;
   operator_approvals: OperatorApprovals;
   outbound_media_provenance: OutboundMediaProvenance;
   plugin_binding_approvals: PluginBindingApprovals;

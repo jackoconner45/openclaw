@@ -84,7 +84,34 @@ describe("prepared agent-command execution identity", () => {
         }),
         run: async () => undefined,
       }),
-    ).rejects.toThrow("disagrees with the prepared run");
+    ).resolves.toBeUndefined();
+  });
+
+  it("isolates independent child roots from an inherited parent identity", async () => {
+    await executionIdentity.runPrepared({
+      prepared: prepared({ runId: "parent-run", enabled: true }),
+      run: async () => {
+        const parent = getExecutionIdentityAdmissionScope();
+        await Promise.resolve();
+        const child = await executionIdentity.runPrepared({
+          prepared: prepared({ runId: "child-run", enabled: true }),
+          run: async () => getExecutionIdentityAdmissionScope(),
+        });
+        expect(child?.token.runId).toBe("child-run");
+        expect(child?.token.executionId).not.toBe(parent?.token.executionId);
+        expect(getExecutionIdentityAdmissionScope()).toBe(parent);
+      },
+    });
+  });
+
+  it("keeps valid overlong public run identifiers nonblocking and unscoped", async () => {
+    const runId = "r".repeat(257);
+    await expect(
+      executionIdentity.runPrepared({
+        prepared: prepared({ runId, enabled: true }),
+        run: async () => ({ ran: true, scope: getExecutionIdentityAdmissionScope() }),
+      }),
+    ).resolves.toEqual({ ran: true, scope: undefined });
   });
 
   it("drops an incidental token entirely while collection is disabled", async () => {

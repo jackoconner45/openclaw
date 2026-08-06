@@ -50,8 +50,6 @@ const OPENCLAW_STATE_MAINTENANCE_SCHEMA_COMPATIBILITY = {
       "target_agent_id TEXT NOT NULL DEFAULT 'main'",
     ],
     "operator_approvals.resolution_ref": ["resolution_ref TEXT"],
-    "operator_approvals.source_context_id": ["source_context_id TEXT"],
-    "operator_approvals.source_execution_id": ["source_execution_id TEXT"],
   },
 } satisfies SqliteSchemaCompatibility;
 

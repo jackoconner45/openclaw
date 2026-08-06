@@ -280,6 +280,16 @@ describe("execution identity approval Gateway e2e", () => {
         .toSorted((left, right) => left.localeCompare(right))
         .map((executionId) => ({ execution_id: executionId })),
     );
+    expect(
+      stateDb
+        .prepare(
+          "SELECT approval_id, source_execution_id FROM operator_approval_execution_identities ORDER BY approval_id",
+        )
+        .all(),
+    ).toEqual([
+      { approval_id: "exact-first", source_execution_id: first.token!.executionId },
+      { approval_id: "exact-second", source_execution_id: second.token!.executionId },
+    ]);
 
     setRuntimeConfigSnapshot(enabledConfig, enabledConfig);
     server = await startGatewayServer(port, {

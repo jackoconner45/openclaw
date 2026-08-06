@@ -149,7 +149,7 @@ type ExecutionIdentityAdmissionSink = (work: ExecutionIdentityAdmissionWork) => 
 
 let admissionSink: ExecutionIdentityAdmissionSink | undefined;
 let admissionFailureWarned = false;
-const admissionScopeStorage = new AsyncLocalStorage<ExecutionIdentityAdmissionScope>();
+const admissionScopeStorage = new AsyncLocalStorage<ExecutionIdentityAdmissionScope | undefined>();
 
 function uniqueSorted<T>(values: readonly T[], key: (value: T) => string): T[] {
   return [...new Map(values.map((value) => [key(value), value])).values()].toSorted((a, b) => {
@@ -218,6 +218,16 @@ export function parseExecutionIdentityAdmissionToken(
 /** Returns the private identity owned by the current admitted outer turn. */
 export function getExecutionIdentityAdmissionScope(): ExecutionIdentityAdmissionScope | undefined {
   return admissionScopeStorage.getStore();
+}
+
+/** Starts an independent admitted root without inheriting its caller's private identity. */
+export async function runWithoutExecutionIdentityAdmissionScope<T>(
+  run: () => Promise<T> | T,
+): Promise<T> {
+  if (!admissionScopeStorage.getStore()) {
+    return await run();
+  }
+  return await admissionScopeStorage.run(undefined, run);
 }
 
 /** Carries one validated token through trusted internal execution hot paths. */
