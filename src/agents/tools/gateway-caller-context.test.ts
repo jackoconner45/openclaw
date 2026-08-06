@@ -11,7 +11,7 @@ import {
   setToolTerminalPresentation,
 } from "../tool-terminal-presentation.js";
 import type { AnyAgentTool } from "./common.js";
-import { wrapToolWithGatewayCallerIdentity } from "./gateway-caller-context.js";
+import { createGatewayToolCallerWrapper } from "./gateway-caller-context.js";
 
 describe("gateway caller context wrapper", () => {
   it("preserves tool metadata used by policy and presentation layers", () => {
@@ -30,10 +30,9 @@ describe("gateway caller context wrapper", () => {
     setToolTerminalPresentation(tool, () => ({ text: "done" }));
 
     const beforeWrapped = wrapToolWithBeforeToolCallHook(tool);
-    const wrapped = wrapToolWithGatewayCallerIdentity(beforeWrapped, {
-      agentId: "agent-a",
-      sessionKey: "agent-a:session",
-    });
+    const wrapped = createGatewayToolCallerWrapper("agent-a", {
+      agentSessionKey: "agent-a:session",
+    })(beforeWrapped);
 
     expect(getPluginToolMeta(wrapped)).toEqual({ pluginId: "plugin-a", optional: false });
     expect(getChannelAgentToolMeta(wrapped as never)).toEqual({ channelId: "telegram" });

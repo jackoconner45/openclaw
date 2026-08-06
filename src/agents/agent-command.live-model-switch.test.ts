@@ -36,6 +36,19 @@ import {
   createAgentRunRestartAbortError,
 } from "./run-termination.js";
 
+type TestExecutionIdentityAdmissionToken = {
+  tokenVersion: 1;
+  contextId: string;
+  executionId: string;
+  runId: string;
+  createdAt: number;
+};
+
+type TestExecutionIdentityAdmissionScope = {
+  token: TestExecutionIdentityAdmissionToken;
+  retryOnly: boolean;
+};
+
 const state = vi.hoisted(() => ({
   defaultRuntimeConfig: {
     agents: {
@@ -117,6 +130,7 @@ const state = vi.hoisted(() => ({
   resolvedSessionKeyMock: undefined as string | undefined,
   trajectoryRecorderParamsMock: vi.fn(),
   enqueueExecutionIdentityContextAtAdmissionMock: vi.fn(),
+  executionIdentityAdmissionScope: undefined as TestExecutionIdentityAdmissionScope | undefined,
 }));
 
 vi.mock("./model-fallback-runner.js", () => ({
@@ -124,8 +138,38 @@ vi.mock("./model-fallback-runner.js", () => ({
 }));
 
 vi.mock("../audit/execution-identity-admission.js", () => ({
+  createExecutionIdentityAdmissionToken: (runId: string): TestExecutionIdentityAdmissionToken => ({
+    tokenVersion: 1,
+    contextId: `context-${runId}`,
+    executionId: `execution-${runId}`,
+    runId,
+    createdAt: 0,
+  }),
   enqueueExecutionIdentityContextAtAdmission: (...args: unknown[]) =>
     state.enqueueExecutionIdentityContextAtAdmissionMock(...args),
+  getExecutionIdentityAdmissionScope: () => state.executionIdentityAdmissionScope,
+  parseExecutionIdentityAdmissionToken: (token: TestExecutionIdentityAdmissionToken) => token,
+  runWithExecutionIdentityAdmissionScope: async (
+    scope: TestExecutionIdentityAdmissionScope,
+    run: () => unknown,
+  ) => {
+    const previous = state.executionIdentityAdmissionScope;
+    state.executionIdentityAdmissionScope = scope;
+    try {
+      return await run();
+    } finally {
+      state.executionIdentityAdmissionScope = previous;
+    }
+  },
+  runWithoutExecutionIdentityAdmissionScope: async (run: () => unknown) => {
+    const previous = state.executionIdentityAdmissionScope;
+    state.executionIdentityAdmissionScope = undefined;
+    try {
+      return await run();
+    } finally {
+      state.executionIdentityAdmissionScope = previous;
+    }
+  },
 }));
 
 vi.mock("./command/attempt-execution.runtime.js", () => ({
@@ -869,6 +913,7 @@ describe("agentCommand – LiveSessionModelSwitchError retry", () => {
     state.resolveAcpDispatchPolicyErrorMock.mockReturnValue(null);
     state.resolveAcpExplicitTurnPolicyErrorMock.mockReturnValue(null);
     state.runtimeConfigMock = undefined;
+    state.executionIdentityAdmissionScope = undefined;
     delete (state.defaultRuntimeConfig.agents as { list?: unknown }).list;
     state.isThinkingLevelSupportedMock.mockReturnValue(true);
     state.resolveSupportedThinkingLevelMock.mockImplementation(
@@ -1090,12 +1135,7 @@ describe("agentCommand – LiveSessionModelSwitchError retry", () => {
 
     await runBasicAgentCommand();
 
-    expect(state.enqueueExecutionIdentityContextAtAdmissionMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        ingress: { kind: "local-cli", boundary: "agent-command.local", state: "present" },
-      }),
-      { enabled: false },
-    );
+    expect(state.enqueueExecutionIdentityContextAtAdmissionMock).not.toHaveBeenCalled();
     expect(state.runAgentAttemptMock).toHaveBeenCalledTimes(1);
   });
 
@@ -1114,14 +1154,14 @@ describe("agentCommand – LiveSessionModelSwitchError retry", () => {
       expect.objectContaining({
         ingress: { kind: "local-cli", boundary: "agent-command.local", state: "present" },
       }),
-      { enabled: true },
+      expect.objectContaining({ enabled: true }),
     );
     expect(state.enqueueExecutionIdentityContextAtAdmissionMock).toHaveBeenNthCalledWith(
       2,
       expect.objectContaining({
         ingress: { kind: "system", boundary: "gateway.boot", state: "present" },
       }),
-      { enabled: true },
+      expect.objectContaining({ enabled: true }),
     );
   });
 

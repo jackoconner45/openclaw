@@ -10,6 +10,10 @@ import type { AgentTool, AgentToolResult } from "openclaw/plugin-sdk/agent-core"
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
+import {
+  createExecutionIdentityAdmissionToken,
+  runWithExecutionIdentityAdmissionScope,
+} from "../audit/execution-identity-admission.js";
 import { replaceSessionEntry } from "../config/sessions/session-accessor.js";
 import type { SessionEntry } from "../config/sessions/types.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
@@ -321,6 +325,83 @@ describe("createOpenClawCodingTools", () => {
     );
     expect(execute).toHaveBeenCalledTimes(1);
     expect(tool.parameters).toEqual({ type: "object", properties: {} });
+  });
+
+  it("keeps one caller identity around finalized standard hooks and rejected execution", async () => {
+    let hookIdentity: unknown;
+    let executeIdentity: unknown;
+    initializeGlobalHookRunner(
+      createMockPluginRegistry([
+        {
+          hookName: "before_tool_call",
+          handler: () => {
+            hookIdentity = getGatewayToolCallerIdentity();
+          },
+        },
+      ]),
+    );
+    vi.mocked(createOpenClawTools).mockReturnValueOnce([
+      {
+        name: "identity_probe",
+        label: "Identity probe",
+        description: "Identity probe",
+        parameters: { type: "object", properties: {} },
+        execute: async () => {
+          executeIdentity = getGatewayToolCallerIdentity();
+          throw new Error("probe failed");
+        },
+      } as never,
+    ]);
+    const token = createExecutionIdentityAdmissionToken("run-standard", {
+      contextId: "context-standard",
+      executionId: "execution-standard",
+      now: 1,
+    });
+    const tools = await runWithExecutionIdentityAdmissionScope({ token, retryOnly: false }, () =>
+      createOpenClawCodingTools({
+        agentId: "main",
+        sessionKey: "agent:main:main",
+        runId: "run-standard",
+      }),
+    );
+
+    await expect(
+      requireTool(tools, "identity_probe").execute?.("tool-call-standard", {}),
+    ).rejects.toThrow("probe failed");
+    expect(hookIdentity).toBe(executeIdentity);
+    expect(executeIdentity).toEqual({
+      agentId: "main",
+      sessionKey: "agent:main:main",
+      executionIdentity: token,
+    });
+    expect(latestCreateOpenClawToolsOptions().deferGatewayCallerIdentity).toBe(true);
+    expect(getGatewayToolCallerIdentity()).toBeUndefined();
+  });
+
+  it("does not invent execution identity without an admitted scope", async () => {
+    let observedIdentity: unknown;
+    vi.mocked(createOpenClawTools).mockReturnValueOnce([
+      {
+        name: "unbound_identity_probe",
+        label: "Unbound identity probe",
+        description: "Unbound identity probe",
+        parameters: { type: "object", properties: {} },
+        execute: async () => {
+          observedIdentity = getGatewayToolCallerIdentity();
+          return { content: [], details: {} };
+        },
+      } as never,
+    ]);
+
+    const tools = createOpenClawCodingTools({
+      agentId: "main",
+      sessionKey: "agent:main:main",
+      config: { logging: { audit: { enabled: false, executionIdentity: true } } },
+    });
+    await requireTool(tools, "unbound_identity_probe").execute?.("tool-call-unbound", {});
+
+    expect(observedIdentity).toEqual({ agentId: "main", sessionKey: "agent:main:main" });
+    expect(getGatewayToolCallerIdentity()).toBeUndefined();
   });
 
   it("adds Tool Search control tools when explicitly requested", () => {
@@ -1096,7 +1177,18 @@ describe("createOpenClawCodingTools", () => {
   });
 
   it("wraps plugin-only tools with scheduled creator authority and live routing context", async () => {
+    let hookIdentity: unknown;
     let observedIdentity: unknown;
+    initializeGlobalHookRunner(
+      createMockPluginRegistry([
+        {
+          hookName: "before_tool_call",
+          handler: () => {
+            hookIdentity = getGatewayToolCallerIdentity();
+          },
+        },
+      ]),
+    );
     const resolvePluginToolsSpy = vi
       .spyOn(openClawPluginTools, "resolveOpenClawPluginToolsForOptions")
       .mockReturnValue([
@@ -1113,50 +1205,61 @@ describe("createOpenClawCodingTools", () => {
       ]);
 
     try {
-      const tools = createOpenClawCodingTools({
-        config: {
-          ...testConfig,
-          channels: {
-            discord: {
-              accounts: {
-                creator: {},
+      const token = createExecutionIdentityAdmissionToken("run-plugin", {
+        contextId: "context-plugin",
+        executionId: "execution-plugin",
+        now: 2,
+      });
+      const tools = await runWithExecutionIdentityAdmissionScope({ token, retryOnly: false }, () =>
+        createOpenClawCodingTools({
+          config: {
+            ...testConfig,
+            channels: {
+              discord: {
+                accounts: {
+                  creator: {},
+                },
               },
             },
           },
-        },
-        agentId: "main",
-        sessionKey: "agent:main:telegram:direct:alice",
-        messageProvider: "discord-voice",
-        messageChannel: "discord",
-        messageTo: "channel:123",
-        agentAccountId: "work",
-        scheduledToolPolicy: {
-          version: 1,
-          mode: "account",
-          ownerSessionKey: "agent:main:discord:group:ops",
-          ownerAccountId: "creator",
-        },
-        messageThreadId: "42",
-        includeCoreTools: false,
-        runtimeToolAllowlist: ["file_fetch"],
-        toolConstructionPlan: {
-          includeBaseCodingTools: false,
-          includeShellTools: false,
-          includeChannelTools: false,
-          includeOpenClawTools: false,
-          includePluginTools: true,
-        },
-      });
+          agentId: "main",
+          sessionKey: "agent:main:telegram:direct:alice",
+          runId: "run-plugin",
+          messageProvider: "discord-voice",
+          messageChannel: "discord",
+          messageTo: "channel:123",
+          agentAccountId: "work",
+          scheduledToolPolicy: {
+            version: 1,
+            mode: "account",
+            ownerSessionKey: "agent:main:discord:group:ops",
+            ownerAccountId: "creator",
+          },
+          messageThreadId: "42",
+          includeCoreTools: false,
+          runtimeToolAllowlist: ["file_fetch"],
+          toolConstructionPlan: {
+            includeBaseCodingTools: false,
+            includeShellTools: false,
+            includeChannelTools: false,
+            includeOpenClawTools: false,
+            includePluginTools: true,
+          },
+        }),
+      );
 
       await requireTool(tools, "file_fetch").execute?.("tool-call-1", {});
+      expect(hookIdentity).toBe(observedIdentity);
       expect(observedIdentity).toEqual({
         agentId: "main",
         sessionKey: "agent:main:telegram:direct:alice",
+        executionIdentity: token,
         turnSourceChannel: "discord",
         turnSourceTo: "channel:123",
         turnSourceAccountId: "creator",
         turnSourceThreadId: "42",
       });
+      expect(getGatewayToolCallerIdentity()).toBeUndefined();
     } finally {
       resolvePluginToolsSpy.mockRestore();
     }

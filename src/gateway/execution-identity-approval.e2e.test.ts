@@ -4,7 +4,9 @@ import os from "node:os";
 import path from "node:path";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
+import { GATEWAY_CLIENT_CAPS } from "../../packages/gateway-protocol/src/client-info.js";
 import { executionIdentity } from "../agents/agent-command-execution-identity.js";
+import { createOpenClawCodingTools } from "../agents/agent-tools.js";
 import type { PreparedAgentCommandExecution } from "../agents/command/prepare.js";
 import type { AnyAgentTool } from "../agents/tools/common.js";
 import { createGatewayToolCallerWrapper } from "../agents/tools/gateway-caller-context.js";
@@ -19,6 +21,11 @@ import {
   setRuntimeConfigSnapshot,
 } from "../config/runtime-snapshot.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { loadOrCreateDeviceIdentity } from "../infra/device-identity.js";
+import { resetGlobalHookRunner } from "../plugins/hook-runner-global.js";
+import { loadAndActivateRootPluginRegistry } from "../plugins/loader.js";
+import { resetPluginLoaderTestStateForTest } from "../plugins/loader.test-fixtures.js";
+import { resetPluginRuntimeStateForTest } from "../plugins/runtime.js";
 import {
   closeOpenClawStateDatabaseForTest,
   openOpenClawStateDatabase,
@@ -40,7 +47,11 @@ const ENV_KEYS = [
   "OPENCLAW_GATEWAY_PORT",
   "OPENCLAW_GATEWAY_TOKEN",
   "OPENCLAW_GATEWAY_PASSWORD",
+  "OPENCLAW_DISABLE_BUNDLED_PLUGINS",
 ];
+
+const APPROVAL_PLUGIN_ID = "execution-identity-approval-e2e";
+const APPROVAL_PLUGIN_TOOL_NAME = "execution_identity_approval_e2e";
 
 type Cleanup = () => Promise<void> | void;
 
@@ -75,6 +86,9 @@ describe("execution identity approval Gateway e2e", () => {
       await step();
     }
     closeOpenClawStateDatabaseForTest();
+    resetGlobalHookRunner();
+    resetPluginRuntimeStateForTest();
+    resetPluginLoaderTestStateForTest();
     clearRuntimeConfigSnapshot();
     clearConfigCache();
   });
@@ -87,19 +101,74 @@ describe("execution identity approval Gateway e2e", () => {
     const stateDir = path.join(home, ".openclaw");
     const configPath = path.join(home, "openclaw.json");
     await fs.mkdir(stateDir, { recursive: true });
+    const pluginDir = path.join(home, "plugins", APPROVAL_PLUGIN_ID);
+    const pluginEntry = path.join(pluginDir, "index.cjs");
+    const readFixture = path.join(home, "approval-fixture.txt");
+    await fs.mkdir(pluginDir, { recursive: true });
+    await Promise.all([
+      fs.writeFile(readFixture, "approval identity fixture\n", "utf8"),
+      fs.writeFile(
+        path.join(pluginDir, "openclaw.plugin.json"),
+        JSON.stringify({
+          id: APPROVAL_PLUGIN_ID,
+          contracts: { tools: [APPROVAL_PLUGIN_TOOL_NAME] },
+          configSchema: { type: "object", additionalProperties: false, properties: {} },
+        }),
+        "utf8",
+      ),
+      fs.writeFile(
+        pluginEntry,
+        `module.exports = {
+  id: ${JSON.stringify(APPROVAL_PLUGIN_ID)},
+  register(api) {
+    api.registerTool({
+      name: ${JSON.stringify(APPROVAL_PLUGIN_TOOL_NAME)},
+      description: "Test-only plugin approval identity tool.",
+      parameters: { type: "object", additionalProperties: false, properties: {} },
+      async execute() {
+        return { content: [{ type: "text", text: "approved" }] };
+      },
+    });
+    api.on("before_tool_call", (event) => {
+      if (event.toolName !== "read" && event.toolName !== ${JSON.stringify(APPROVAL_PLUGIN_TOOL_NAME)}) {
+        return;
+      }
+      return {
+        requireApproval: {
+          title: "Approve identity E2E tool",
+          description: "Exercise the durable plugin approval owner binding.",
+          severity: "warning",
+          timeoutMs: 60000,
+          allowedDecisions: ["allow-once", "deny"],
+        },
+      };
+    });
+  },
+};
+`,
+        "utf8",
+      ),
+    ]);
 
     const port = await getFreeGatewayPort();
     const gatewayToken = "execution-approval-e2e-token";
     const enabledConfig: OpenClawConfig = {
       gateway: { port, auth: { mode: "token", token: gatewayToken } },
       logging: { audit: { enabled: true, executionIdentity: true } },
-      plugins: { enabled: false },
+      plugins: {
+        enabled: true,
+        allow: [APPROVAL_PLUGIN_ID],
+        load: { paths: [pluginEntry] },
+        entries: { [APPROVAL_PLUGIN_ID]: { enabled: true } },
+        slots: { memory: "none" },
+      },
     };
     await fs.writeFile(configPath, JSON.stringify(enabledConfig), "utf8");
     setTestEnvValue("HOME", home);
     setTestEnvValue("OPENCLAW_STATE_DIR", stateDir);
     setTestEnvValue("OPENCLAW_CONFIG_PATH", configPath);
     setTestEnvValue("OPENCLAW_GATEWAY_PORT", String(port));
+    setTestEnvValue("OPENCLAW_DISABLE_BUNDLED_PLUGINS", "1");
     setRuntimeConfigSnapshot(enabledConfig, enabledConfig);
 
     let server = await startGatewayServer(port, {
@@ -109,7 +178,114 @@ describe("execution identity approval Gateway e2e", () => {
       sidecarStartup: "defer",
     });
     cleanup.push(async () => server.close());
+    loadAndActivateRootPluginRegistry({
+      cache: false,
+      config: enabledConfig,
+      env: process.env,
+      workspaceDir: home,
+    });
     const url = `ws://127.0.0.1:${port}`;
+    const approvalIds = new Map<string, string>();
+    const approvalResolutions: Promise<unknown>[] = [];
+    const approvalDeviceIdentity = loadOrCreateDeviceIdentity({
+      path: path.join(stateDir, "approval-resolver.sqlite"),
+    });
+    const resolveApprovalRequest = (id: string) =>
+      approvalClient.request(
+        "plugin.approval.resolve",
+        { id, decision: "allow-once" },
+        { timeoutMs: 30_000 },
+      );
+    const approvalClient = await connectGatewayClient({
+      url,
+      token: gatewayToken,
+      clientDisplayName: "approval identity resolver",
+      scopes: [APPROVALS_SCOPE],
+      caps: [GATEWAY_CLIENT_CAPS.APPROVALS],
+      deviceIdentity: approvalDeviceIdentity,
+      timeoutMs: 60_000,
+      onEvent: (event) => {
+        if (event.event !== "plugin.approval.requested") {
+          return;
+        }
+        const payload = event.payload as
+          | { id?: unknown; request?: { pluginId?: unknown; toolName?: unknown } }
+          | undefined;
+        if (
+          typeof payload?.id !== "string" ||
+          payload.request?.pluginId !== APPROVAL_PLUGIN_ID ||
+          typeof payload.request.toolName !== "string"
+        ) {
+          return;
+        }
+        approvalIds.set(payload.request.toolName, payload.id);
+        approvalResolutions.push(resolveApprovalRequest(payload.id));
+      },
+    });
+    cleanup.push(async () => disconnectGatewayClient(approvalClient!));
+
+    const requestFromComposedTool = async (params: {
+      runId: string;
+      toolName: string;
+      includeCoreTools: boolean;
+      toolParams: Record<string, unknown>;
+    }) =>
+      await executionIdentity.runPrepared({
+        prepared: prepared({ cfg: enabledConfig, runId: params.runId }),
+        run: async () => {
+          const scope = getExecutionIdentityAdmissionScope();
+          executionIdentity.record({
+            agentId: "main",
+            cfg: enabledConfig,
+            ingress: executionIdentity.localIngress,
+            runId: params.runId,
+            runtimeKind: "embedded",
+          });
+          const tools = createOpenClawCodingTools({
+            agentId: "main",
+            sessionKey: "agent:main:main",
+            runSessionKey: "agent:main:main",
+            runId: params.runId,
+            approvalReviewerDeviceId: approvalDeviceIdentity.deviceId,
+            config: enabledConfig,
+            cwd: home,
+            workspaceDir: home,
+            includeCoreTools: params.includeCoreTools,
+            runtimeToolAllowlist: params.includeCoreTools ? undefined : [APPROVAL_PLUGIN_TOOL_NAME],
+            toolConstructionPlan: {
+              includeBaseCodingTools: params.includeCoreTools,
+              includeShellTools: false,
+              includeChannelTools: false,
+              includeOpenClawTools: false,
+              includePluginTools: !params.includeCoreTools,
+            },
+          });
+          const tool = tools.find((candidate) => candidate.name === params.toolName);
+          if (!tool?.execute) {
+            throw new Error(`composed tool missing: ${params.toolName}`);
+          }
+          await tool.execute(`call-${params.runId}`, params.toolParams);
+          return scope?.token;
+        },
+      });
+
+    const coreToken = await requestFromComposedTool({
+      runId: "composed-core-run",
+      toolName: "read",
+      includeCoreTools: true,
+      toolParams: { path: readFixture },
+    });
+    const pluginToken = await requestFromComposedTool({
+      runId: "composed-plugin-run",
+      toolName: APPROVAL_PLUGIN_TOOL_NAME,
+      includeCoreTools: false,
+      toolParams: {},
+    });
+    await Promise.all(approvalResolutions);
+    expect(coreToken).toBeDefined();
+    expect(pluginToken).toBeDefined();
+    expect(approvalIds.get("read")).toBeDefined();
+    expect(approvalIds.get(APPROVAL_PLUGIN_TOOL_NAME)).toBeDefined();
 
     const requestFromRun = async (params: {
       id: string;
@@ -261,6 +437,20 @@ describe("execution identity approval Gateway e2e", () => {
       contextId: null,
       executionId: null,
     });
+    expect(owner(approvalIds.get("read")!)).toMatchObject({
+      agentId: "main",
+      sessionKey: "agent:main:main",
+      runId: "composed-core-run",
+      contextId: coreToken?.contextId,
+      executionId: coreToken?.executionId,
+    });
+    expect(owner(approvalIds.get(APPROVAL_PLUGIN_TOOL_NAME)!)).toMatchObject({
+      agentId: "main",
+      sessionKey: "agent:main:main",
+      runId: "composed-plugin-run",
+      contextId: pluginToken?.contextId,
+      executionId: pluginToken?.executionId,
+    });
     const stateDb = openOpenClawStateDatabase(databaseOptions).db;
     expect(
       stateDb
@@ -286,10 +476,20 @@ describe("execution identity approval Gateway e2e", () => {
           "SELECT approval_id, source_execution_id FROM operator_approval_execution_identities ORDER BY approval_id",
         )
         .all(),
-    ).toEqual([
-      { approval_id: "exact-first", source_execution_id: first.token!.executionId },
-      { approval_id: "exact-second", source_execution_id: second.token!.executionId },
-    ]);
+    ).toEqual(
+      [
+        { approval_id: "exact-first", source_execution_id: first.token!.executionId },
+        { approval_id: "exact-second", source_execution_id: second.token!.executionId },
+        {
+          approval_id: approvalIds.get("read")!,
+          source_execution_id: coreToken!.executionId,
+        },
+        {
+          approval_id: approvalIds.get(APPROVAL_PLUGIN_TOOL_NAME)!,
+          source_execution_id: pluginToken!.executionId,
+        },
+      ].toSorted((left, right) => left.approval_id.localeCompare(right.approval_id)),
+    );
 
     setRuntimeConfigSnapshot(enabledConfig, enabledConfig);
     server = await startGatewayServer(port, {

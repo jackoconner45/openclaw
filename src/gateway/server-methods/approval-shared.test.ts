@@ -1703,48 +1703,102 @@ describe("handlePendingApprovalRequest", () => {
   });
 
   it.each([
-    { name: "exact", enabled: true, requestRunId: "run-1", trusted: true, expectedBound: true },
+    {
+      name: "exact",
+      approvalKind: "exec" as const,
+      enabled: true,
+      requestAgentId: undefined,
+      requestRunId: "run-1",
+      requestSessionKey: undefined,
+      trusted: true,
+      expectedBound: true,
+    },
     {
       name: "plugin-style",
+      approvalKind: "plugin" as const,
+      enabled: true,
+      requestAgentId: undefined,
+      requestRunId: undefined,
+      requestSessionKey: undefined,
+      trusted: true,
+      expectedBound: true,
+    },
+    {
+      name: "exec-owner-mismatch",
+      approvalKind: "exec" as const,
+      enabled: true,
+      requestRunId: "run-1",
+      requestAgentId: "forged",
+      requestSessionKey: "agent:forged:main",
+      trusted: true,
+      expectedBound: true,
+    },
+    {
+      name: "plugin-owner-mismatch",
+      approvalKind: "plugin" as const,
       enabled: true,
       requestRunId: undefined,
+      requestAgentId: "forged",
+      requestSessionKey: "agent:forged:main",
       trusted: true,
       expectedBound: true,
     },
     {
       name: "mismatch",
+      approvalKind: "exec" as const,
       enabled: true,
+      requestAgentId: undefined,
       requestRunId: "run-other",
+      requestSessionKey: undefined,
       trusted: true,
       expectedBound: false,
     },
     {
       name: "disabled",
+      approvalKind: "exec" as const,
       enabled: false,
+      requestAgentId: undefined,
       requestRunId: "run-1",
+      requestSessionKey: undefined,
       trusted: true,
       expectedBound: false,
     },
     {
       name: "ordinary-rpc",
+      approvalKind: "exec" as const,
       enabled: true,
+      requestAgentId: undefined,
       requestRunId: "run-1",
+      requestSessionKey: undefined,
       trusted: false,
       expectedBound: false,
     },
   ])(
     "persists $name execution identity only from enabled trusted matching runtime state",
-    ({ enabled, requestRunId, trusted, expectedBound, name }) => {
+    ({
+      approvalKind,
+      enabled,
+      requestAgentId,
+      requestRunId,
+      requestSessionKey,
+      trusted,
+      expectedBound,
+      name,
+    }) => {
       const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `openclaw-approval-binding-${name}-`));
       const databaseOptions = { path: path.join(tempDir, "state.sqlite") };
-      const manager = new ExecApprovalManager({
-        approvalKind: "exec",
+      const request = {
+        ...(approvalKind === "exec"
+          ? { command: "echo safe" }
+          : { title: "Plugin action", description: "Approve a plugin action" }),
+        ...(requestRunId ? { runId: requestRunId } : {}),
+        ...(requestAgentId ? { agentId: requestAgentId } : {}),
+        ...(requestSessionKey ? { sessionKey: requestSessionKey } : {}),
+      };
+      const manager = new ExecApprovalManager<typeof request>({
+        approvalKind,
         persistence: { runtimeEpoch: "binding-test", databaseOptions },
       });
-      const request = {
-        command: "echo safe",
-        ...(requestRunId ? { runId: requestRunId } : {}),
-      };
       const record = manager.create(request, 60_000, `binding-${name}`);
       const executionIdentity = {
         tokenVersion: 1 as const,
@@ -1754,7 +1808,11 @@ describe("handlePendingApprovalRequest", () => {
         createdAt: 1,
       };
       if (!expectedBound) {
-        record.sourceExecutionIdentity = executionIdentity;
+        record.sourceRuntimeIdentity = {
+          agentId: "stale",
+          sessionKey: "agent:stale:main",
+          executionIdentity,
+        };
       }
       try {
         const decision = registerPendingApprovalRecord({
@@ -1789,11 +1847,15 @@ describe("handlePendingApprovalRequest", () => {
           record: {
             source: expectedBound
               ? {
+                  agentId: "main",
+                  sessionKey: "agent:main:main",
                   runId: "run-1",
                   contextId: "context-1",
                   executionId: "execution-1",
                 }
               : {
+                  agentId: requestAgentId ?? null,
+                  sessionKey: requestSessionKey ?? null,
                   runId: requestRunId ?? null,
                   contextId: null,
                   executionId: null,

@@ -70,7 +70,7 @@ export async function withGatewayToolCallerIdentity<T>(
   );
 }
 
-export function wrapToolWithGatewayCallerIdentity(
+function wrapToolWithGatewayCallerIdentity(
   tool: AnyAgentTool,
   identity: GatewayToolCallerIdentity | undefined,
 ): AnyAgentTool {

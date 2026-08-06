@@ -87,8 +87,12 @@ export type ExecApprovalRecord<TPayload = ExecApprovalRequestPayload> = {
   requestedByClientId?: string | null;
   requestedByDeviceTokenAuth?: boolean;
   approvalReviewerDeviceIds?: string[];
-  /** Verified private execution owner; never projected into approval events. */
-  sourceExecutionIdentity?: ExecutionIdentityAdmissionToken;
+  /** Verified private runtime owner; never projected into approval events. */
+  sourceRuntimeIdentity?: {
+    agentId: string;
+    sessionKey: string;
+    executionIdentity: ExecutionIdentityAdmissionToken;
+  };
   resolvedAtMs?: number;
   decision?: ExecApprovalDecision;
   consumedDecision?: ExecApprovalDecision;
@@ -176,11 +180,12 @@ function readRequestString(request: unknown, key: string): string | null {
 
 function resolveApprovalSource(
   request: unknown,
-  executionIdentity?: ExecutionIdentityAdmissionToken,
+  runtimeIdentity?: ExecApprovalRecord["sourceRuntimeIdentity"],
 ): OperatorApprovalSource {
+  const executionIdentity = runtimeIdentity?.executionIdentity;
   return {
-    agentId: readRequestString(request, "agentId"),
-    sessionKey: readRequestString(request, "sessionKey"),
+    agentId: runtimeIdentity?.agentId ?? readRequestString(request, "agentId"),
+    sessionKey: runtimeIdentity?.sessionKey ?? readRequestString(request, "sessionKey"),
     sessionId: readRequestString(request, "sessionId"),
     runId: executionIdentity?.runId ?? readRequestString(request, "runId"),
     contextId: executionIdentity?.contextId ?? null,
@@ -305,7 +310,7 @@ export class ExecApprovalManager<TPayload = ExecApprovalRequestPayload> {
 
     let insertedRecord: OperatorApprovalRecord | null = null;
     if (persistence) {
-      const source = resolveApprovalSource(record.request, record.sourceExecutionIdentity);
+      const source = resolveApprovalSource(record.request, record.sourceRuntimeIdentity);
       let audienceSessionKeys: string[] = [];
       if (source.sessionKey) {
         // The injected resolver owns lineage lookup plus its own agent-scoped
@@ -389,7 +394,7 @@ export class ExecApprovalManager<TPayload = ExecApprovalRequestPayload> {
       return null;
     }
     const status = record.status ?? (record.resolvedAtMs === undefined ? "pending" : "denied");
-    const source = resolveApprovalSource(record.request, record.sourceExecutionIdentity);
+    const source = resolveApprovalSource(record.request, record.sourceRuntimeIdentity);
     return {
       id: record.id,
       resolutionRef: buildApprovalResolutionRef({

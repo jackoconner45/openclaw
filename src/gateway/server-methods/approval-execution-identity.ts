@@ -11,8 +11,9 @@ export function bindApprovalExecutionIdentity<TPayload>(params: {
   client?: GatewayClient | null;
   record: ExecApprovalRecord<TPayload>;
 }): void {
-  params.record.sourceExecutionIdentity = undefined;
-  const raw = params.client?.internal?.agentRuntimeIdentity?.executionIdentity;
+  params.record.sourceRuntimeIdentity = undefined;
+  const runtimeIdentity = params.client?.internal?.agentRuntimeIdentity;
+  const raw = runtimeIdentity?.executionIdentity;
   if (!raw || !isExecutionIdentityCollectionEnabled(params.cfg)) {
     return;
   }
@@ -26,7 +27,11 @@ export function bindApprovalExecutionIdentity<TPayload>(params: {
     // Bind only when the approval's effective source run agrees with the verified token.
     // A mismatch is non-authoritative; neither correlation may override the other.
     if (!requestRunId || requestRunId === identity.runId) {
-      params.record.sourceExecutionIdentity = identity;
+      params.record.sourceRuntimeIdentity = {
+        agentId: runtimeIdentity.agentId,
+        sessionKey: runtimeIdentity.sessionKey,
+        executionIdentity: identity,
+      };
     }
   } catch {
     // Invalid synthetic client state is never authoritative.
