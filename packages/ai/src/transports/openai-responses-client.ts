@@ -42,6 +42,12 @@ import {
 } from "./openai-responses-stream-internal.js";
 import { observeResponsesStream } from "./openai-responses-stream-observer-internal.js";
 import {
+  createOpenAISdkAccountingFetch,
+  failOpenAISdkTransportScope,
+  finishOpenAISdkTransportScope,
+  registerOpenAISdkTransportScope,
+} from "./openai-sdk-transport-accounting-internal.js";
+import {
   assertCodeModeResponsesToolSurface,
   buildOpenAIClientHeaders,
   buildOpenAISdkClientOptions,
@@ -95,15 +101,31 @@ export function createOpenAIResponsesClient(
   optionHeaders?: Record<string, string>,
   turnHeaders?: Record<string, string>,
   sessionId?: string,
+  requestId?: string,
+  callerSignal?: AbortSignal,
+  accountingOverride?: ReturnType<typeof createOpenAISdkAccountingFetch>,
 ) {
-  return new OpenAI({
+  const accounting =
+    accountingOverride ??
+    createOpenAISdkAccountingFetch({
+      model,
+      ...(requestId ? { callId: requestId } : {}),
+      scopeId: requestId ?? randomUUID(),
+      callerSignal,
+    });
+  const guardedFetch = buildGuardedModelFetch(model, undefined, {
+    onFetchDispatch: accounting.onFetchDispatch,
+  });
+  const client = new OpenAI({
     apiKey,
     baseURL: model.baseUrl,
     dangerouslyAllowBrowser: true,
     defaultHeaders: buildOpenAIClientHeaders(model, context, optionHeaders, turnHeaders, sessionId),
-    fetch: buildGuardedModelFetch(model),
+    fetch: accounting.wrapGuardedFetch(guardedFetch),
     ...buildOpenAISdkClientOptions(model),
   });
+  registerOpenAISdkTransportScope(client, accounting.scope);
+  return client;
 }
 
 type ResponsesPricingOptions = Pick<
@@ -136,6 +158,13 @@ type ResponsesTransportExecutorOptions = {
 function createResponsesTransportExecutor(config: ResponsesTransportExecutorOptions): StreamFn {
   return (model, context, options) => {
     const responsesOptions = options as OpenAIResponsesOptions | undefined;
+    const accounting = createOpenAISdkAccountingFetch({
+      model,
+      ...(options?.requestId ? { callId: options.requestId } : {}),
+      scopeId: options?.requestId ?? randomUUID(),
+      callerSignal: options?.signal,
+      ...(options?.maxRetries === undefined ? {} : { maxRetries: options.maxRetries }),
+    });
     const eventStream = createAssistantMessageEventStream();
     const stream = eventStream as unknown as { push(event: unknown): void; end(): void };
     void (async () => {
@@ -157,6 +186,7 @@ function createResponsesTransportExecutor(config: ResponsesTransportExecutorOpti
         timestamp: Date.now(),
       };
       let firstEventAbort: ReturnType<typeof createFirstStreamEventAbortController> | undefined;
+      let client: ReturnType<ResponsesTransportExecutorOptions["createClient"]> | undefined;
       try {
         const apiKey = options?.apiKey || getEnvApiKey(model.provider) || "";
         const turnState = resolveProviderTransportTurnState(model, {
@@ -165,13 +195,16 @@ function createResponsesTransportExecutor(config: ResponsesTransportExecutorOpti
           attempt: 1,
           transport: "stream",
         });
-        const client = config.createClient(
+        client = config.createClient(
           model,
           context,
           apiKey,
           options?.headers,
           turnState?.headers,
           options?.sessionId,
+          options?.requestId,
+          options?.signal,
+          accounting,
         );
         let params = config.buildRequest(model, context, responsesOptions, turnState?.metadata);
         const nextParams = await options?.onPayload?.(params, model);
@@ -252,9 +285,14 @@ function createResponsesTransportExecutor(config: ResponsesTransportExecutorOpti
         if (output.stopReason === "aborted" || output.stopReason === "error") {
           throw new Error("An unknown error occurred");
         }
+        finishOpenAISdkTransportScope(accounting.scope, "completed", response.status);
         stream.push({ type: "done", reason: output.stopReason as never, message: output as never });
         stream.end();
       } catch (error) {
+        failOpenAISdkTransportScope(
+          accounting.scope,
+          options?.signal?.aborted ? "aborted" : "failed",
+        );
         if (error instanceof ResponsesStreamFailure && error.observation) {
           logResponsesFailedNoDetails(error.observation);
         }
@@ -323,25 +361,44 @@ export function createAzureOpenAIClient(
   apiKey: string,
   optionHeaders?: Record<string, string>,
   turnHeaders?: Record<string, string>,
+  _sessionId?: string,
+  requestId?: string,
+  callerSignal?: AbortSignal,
+  accountingOverride?: ReturnType<typeof createOpenAISdkAccountingFetch>,
 ) {
   const baseURL = normalizeAzureBaseUrl(model.baseUrl);
+  const accounting =
+    accountingOverride ??
+    createOpenAISdkAccountingFetch({
+      model,
+      ...(requestId ? { callId: requestId } : {}),
+      scopeId: requestId ?? randomUUID(),
+      callerSignal,
+    });
+  const guardedFetch = buildGuardedModelFetch(model, undefined, {
+    onFetchDispatch: accounting.onFetchDispatch,
+  });
   const clientOptions = {
     apiKey,
     dangerouslyAllowBrowser: true,
     defaultHeaders: buildOpenAIClientHeaders(model, context, optionHeaders, turnHeaders),
     baseURL,
-    fetch: buildGuardedModelFetch(model),
+    fetch: accounting.wrapGuardedFetch(guardedFetch),
     ...buildOpenAISdkClientOptions(model),
   };
 
   if (isOpenAICompatibleAzureResponsesBaseUrl(baseURL)) {
-    return new OpenAI(clientOptions);
+    const client = new OpenAI(clientOptions);
+    registerOpenAISdkTransportScope(client, accounting.scope);
+    return client;
   }
 
-  return new AzureOpenAI({
+  const client = new AzureOpenAI({
     ...clientOptions,
     apiVersion: resolveAzureOpenAIApiVersion(),
   });
+  registerOpenAISdkTransportScope(client, accounting.scope);
+  return client;
 }
 
 function buildAzureOpenAIResponsesParams(

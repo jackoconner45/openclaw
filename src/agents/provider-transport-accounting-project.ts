@@ -49,6 +49,10 @@ export type ProviderTransportProjectionCall = {
   currentTransport?: string;
   currentServingModel?: string;
   nextConnectionOrdinal: number;
+  fallbackCause?: {
+    transport: string;
+    reason: "connection_failure" | "stream_failure";
+  };
   lastAttempt?: {
     ordinal: number;
     transport: string;
@@ -98,6 +102,38 @@ export type ProviderTransportProjectionState = {
   eventDetailsTruncated: boolean;
   issues: Set<ProviderTransportAccountingCoverageReason>;
 };
+
+export function lowerMissingTransportFallbackCause(
+  event: Extract<AiModelTransportEvent, { type: "fallback" }>,
+  state: ProviderTransportProjectionState,
+): void {
+  const aggregate =
+    event.reason === "connection_failure"
+      ? "connections"
+      : event.reason === "stream_failure"
+        ? "attempts"
+        : undefined;
+  if (aggregate) {
+    state.aggregateLowerBounds[aggregate] = true;
+    state.issues.add("transport_totals_lower_bound");
+  }
+}
+
+export function countProviderTransportFallback(
+  event: Extract<AiModelTransportEvent, { type: "fallback" }>,
+  state: ProviderTransportProjectionState,
+): void {
+  state.aggregate.fallbacks.total += 1;
+  const key =
+    event.reason === "connection_failure"
+      ? "connectionFailures"
+      : event.reason === "submission_failure"
+        ? "submissionFailures"
+        : event.reason === "stream_failure"
+          ? "streamFailures"
+          : event.reason;
+  state.aggregate.fallbacks[key] += 1;
+}
 
 export function retainProviderTransportEventDetail(
   event: AiModelTransportEvent,

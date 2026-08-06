@@ -6,6 +6,7 @@ import {
   AI_MODEL_ZERO_SUBMISSION_OUTCOMES,
   type AiModelTransportEvent,
 } from "@openclaw/ai";
+import type { ProviderTransportProjectionCall } from "./provider-transport-accounting-project.js";
 import type { ProviderTransportAccountingCoverageReason } from "./provider-transport-accounting.types.js";
 
 const MAX_MODEL_TRANSPORT_IDENTITY_LENGTH = 256;
@@ -26,6 +27,30 @@ type RejectTransportFact = (
 
 export function isKnownValue<T extends string>(value: unknown, allowed: readonly T[]): value is T {
   return typeof value === "string" && (allowed as readonly string[]).includes(value);
+}
+
+export function hasTransportFallbackCause(
+  event: Extract<AiModelTransportEvent, { type: "fallback" }>,
+  call: ProviderTransportProjectionCall,
+): boolean {
+  switch (event.reason) {
+    case "connection_failure":
+      return (
+        call.fallbackCause?.transport === event.fromTransport &&
+        call.fallbackCause.reason === "connection_failure"
+      );
+    case "submission_failure":
+      return call.fallbackCause === undefined;
+    case "stream_failure":
+      return (
+        call.fallbackCause?.transport === event.fromTransport &&
+        call.fallbackCause.reason === "stream_failure"
+      );
+    case "policy":
+    case "unsupported":
+      return true;
+  }
+  return false;
 }
 
 export function normalizeIdentity(value: unknown): { value?: string; overflow: boolean } {

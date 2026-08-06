@@ -126,6 +126,7 @@ export const AI_MODEL_TRANSPORT_CONNECTION_REASONS = ["initial", "prewarm", "rec
 export const AI_MODEL_TRANSPORT_FALLBACK_REASONS = [
   "unsupported",
   "connection_failure",
+  "submission_failure",
   "stream_failure",
   "policy",
 ] as const;
@@ -159,15 +160,15 @@ type AiModelTransportCallEventBase = AiModelTransportEventBase & {
 /**
  * Provider transport facts for one model call.
  *
- * An attempt is one submitted provider request. Its ordinal starts at one and
+ * An attempt is one dispatched provider request. Its ordinal starts at one and
  * advances within one call; connection setup and run-scoped prewarm never count
  * as attempts. A transport fallback remains pending until a matching
  * `transport_fallback` attempt or zero-submission phase consumes it. Retries stay
  * on the current transport. Zero-submission facts describe one route phase that
- * ended before submission, including a pending fallback target after earlier
- * failed attempts. Server-side provider fallback records an in-request serving
- * model transition without changing the requested provider, model, API, or
- * active transport.
+ * ended before the dispatch boundary, including a pending fallback target after
+ * earlier failed attempts. Server-side provider fallback records an in-request
+ * serving model transition without changing the requested provider, model, API,
+ * or active transport.
  */
 export type AiModelTransportEvent =
   | (AiModelTransportCallEventBase & {
@@ -234,7 +235,14 @@ export interface AiTransportHost {
   buildModelFetch(
     model: Model,
     timeoutMs?: number,
-    options?: { sanitizeSse?: boolean },
+    options?: {
+      sanitizeSse?: boolean;
+      /**
+       * Fires once immediately before the first fetch invocation, after request
+       * preflight. Redirect hops remain one transport attempt.
+       */
+      onFetchDispatch?: () => void;
+    },
   ): typeof fetch | undefined;
   /** Resolves host-owned process-local secret sentinel substrings immediately before egress. */
   resolveSecretSentinel(value: string): string;

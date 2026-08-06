@@ -289,6 +289,10 @@ describe("provider transport accounting", () => {
     });
 
     expect(collector.project()).toMatchObject({
+      coverage: {
+        state: "partial",
+        reasons: expect.arrayContaining(["transport_invalid_ordinal"]),
+      },
       snapshot: {
         logicalCalls: { entries: [{ transport: "http", outcome: "completed" }] },
         attempts: { total: 1, totalKind: "exact" },
@@ -615,12 +619,30 @@ describe("provider transport accounting", () => {
       observeProviderTransportLogicalCallSettled("call-event-details", "failed");
     });
 
-    expect(collector.project()).toMatchObject({
+    const projection = collector.project();
+    expect(projection).toMatchObject({
+      coverage: {
+        state: "partial",
+        reasons: expect.arrayContaining(["transport_details_truncated"]),
+      },
       snapshot: {
-        attempts: { total: 129, totalKind: "exact" },
-        events: { total: 129, totalKind: "exact", entriesTruncated: true },
+        attempts: {
+          total: 129,
+          totalKind: "exact",
+          initial: 1,
+          retries: 128,
+          authRecoveries: 0,
+          payloadRecoveries: 0,
+          transportFallbacks: 0,
+        },
+        events: {
+          total: 129,
+          totalKind: "exact",
+          entriesTruncated: true,
+        },
       },
     });
+    expect(projection.snapshot?.events.entries).toHaveLength(128);
   });
 
   it("bounds event identities without lowering retained call outcomes", () => {

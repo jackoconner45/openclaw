@@ -48,13 +48,14 @@ A runnable version lives in the repository at `examples/ai-chat`.
   example SSRF policy), secret redaction of tool-result replay text, OpenAI
   strict-tool defaults, diagnostics logging, and typed transport-event
   observation are `AiTransportHost` ports configured with
-  `configureAiTransportHost`. One attempt means one submitted provider request;
-  connection setup and prewarm do not count as attempts. Transport fallback
+  `configureAiTransportHost`. One attempt means one dispatched provider request;
+  connection setup and prewarm do not count as attempts. A zero-submission fact
+  means the route phase ended before the dispatch boundary. Transport fallback
   stages a concrete target until a matching attempt or zero-submission phase
   consumes it. A server-side serving-model fallback is in-stream submission
   evidence and does not rewrite the requested provider/model/API identity.
   Scoped coverage can mark only provider-fallback identity lower-bound when
-  terminal metadata is unavailable; submitted attempt and event totals remain
+  terminal metadata is unavailable; dispatched attempt and event totals remain
   exact. The library default observer is inert; OpenClaw installs its collector
   in its stream facade. Provider coverage depends on which adapters emit these
   facts.

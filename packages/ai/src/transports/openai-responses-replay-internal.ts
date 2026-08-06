@@ -28,6 +28,7 @@ import {
 } from "./openai-responses-contracts.js";
 import type { createResponsesPromptEgressObserver } from "./openai-responses-prompt-observer-internal.js";
 import { resolveReplayableResponsesMessageId } from "./openai-responses-replay.js";
+import { markOpenAISdkPayloadRecovery } from "./openai-sdk-transport-accounting-internal.js";
 import { log } from "./openai-transport-shared.js";
 import {
   sanitizeNonEmptyTransportPayloadText,
@@ -242,6 +243,7 @@ export async function createResponsesStreamWithEncryptedContentRetry(params: {
       `[responses] retrying without encrypted reasoning content provider=${params.model.provider} ` +
         `api=${params.model.api} model=${params.model.id}`,
     );
+    markOpenAISdkPayloadRecovery(params.client);
     params.observePrompt?.(retryRequest, {
       egress: "responses-sdk",
       payloadVariant: "encrypted-content-retry",

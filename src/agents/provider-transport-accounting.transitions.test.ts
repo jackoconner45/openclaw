@@ -8,6 +8,7 @@ import {
 import {
   ANTHROPIC_ROUTE,
   emitAttempt,
+  emitConnection,
   emitProviderFallbackCoverage,
   emitServerFallback,
   emitTransportFallback,
@@ -56,6 +57,12 @@ describe("provider transport accounting transitions", () => {
     const collector = createProviderTransportAccountingCollector();
     runWithProviderTransportAccountingObserver(collector.observer, () => {
       startCall("call-pre-send");
+      emitConnection({
+        callId: "call-pre-send",
+        ordinal: 1,
+        transport: "websocket",
+        outcome: "failed",
+      });
       emitTransportFallback({
         callId: "call-pre-send",
         fromTransport: "websocket",
@@ -80,6 +87,242 @@ describe("provider transport accounting transitions", () => {
         },
         attempts: { total: 1, transportFallbacks: 1 },
         fallbacks: { total: 1, connectionFailures: 1 },
+      },
+    });
+  });
+
+  it("counts a submission failure fallback separately from connection failures", () => {
+    const collector = createProviderTransportAccountingCollector();
+    runWithProviderTransportAccountingObserver(collector.observer, () => {
+      startCall("call-submit-failure");
+      emitConnection({
+        callId: "call-submit-failure",
+        ordinal: 1,
+        transport: "websocket",
+        outcome: "completed",
+      });
+      emitTransportFallback({
+        callId: "call-submit-failure",
+        fromTransport: "websocket",
+        toTransport: "sse",
+        reason: "submission_failure",
+      });
+      emitAttempt({
+        callId: "call-submit-failure",
+        ordinal: 1,
+        reason: "transport_fallback",
+        transport: "sse",
+        outcome: "completed",
+      });
+      observeProviderTransportLogicalCallSettled("call-submit-failure", "completed");
+    });
+
+    expect(collector.project()).toMatchObject({
+      coverage: { state: "complete" },
+      snapshot: {
+        attempts: { total: 1, transportFallbacks: 1 },
+        fallbacks: {
+          total: 1,
+          connectionFailures: 0,
+          submissionFailures: 1,
+          streamFailures: 0,
+        },
+      },
+    });
+  });
+
+  it("accepts cached-route submission failure without inventing a connection", () => {
+    const collector = createProviderTransportAccountingCollector();
+    runWithProviderTransportAccountingObserver(collector.observer, () => {
+      startCall("call-cached-submit-failure");
+      emitTransportFallback({
+        callId: "call-cached-submit-failure",
+        fromTransport: "websocket",
+        toTransport: "sse",
+        reason: "submission_failure",
+      });
+      emitAttempt({
+        callId: "call-cached-submit-failure",
+        ordinal: 1,
+        reason: "transport_fallback",
+        transport: "sse",
+        outcome: "completed",
+      });
+      observeProviderTransportLogicalCallSettled("call-cached-submit-failure", "completed");
+    });
+
+    expect(collector.project()).toMatchObject({
+      coverage: { state: "complete" },
+      snapshot: {
+        connections: { total: 0, totalKind: "exact" },
+        attempts: { total: 1, transportFallbacks: 1, totalKind: "exact" },
+        fallbacks: { total: 1, submissionFailures: 1, totalKind: "exact" },
+      },
+    });
+  });
+
+  it("rejects stale or wrong phase causes without mutating the route", () => {
+    const staleCollector = createProviderTransportAccountingCollector();
+    runWithProviderTransportAccountingObserver(staleCollector.observer, () => {
+      startCall("call-stale-connection");
+      emitConnection({
+        callId: "call-stale-connection",
+        ordinal: 1,
+        transport: "websocket",
+        outcome: "failed",
+      });
+      emitConnection({
+        callId: "call-stale-connection",
+        ordinal: 2,
+        transport: "websocket",
+        outcome: "completed",
+      });
+      emitTransportFallback({
+        callId: "call-stale-connection",
+        fromTransport: "websocket",
+        toTransport: "sse",
+        reason: "connection_failure",
+      });
+    });
+
+    expect(staleCollector.project()).toMatchObject({
+      coverage: {
+        state: "partial",
+        reasons: expect.arrayContaining(["transport_invalid_fact", "transport_totals_lower_bound"]),
+      },
+      snapshot: {
+        connections: { total: 2, totalKind: "lower_bound" },
+        fallbacks: { total: 0, totalKind: "lower_bound" },
+      },
+    });
+
+    const wrongReasonCollector = createProviderTransportAccountingCollector();
+    runWithProviderTransportAccountingObserver(wrongReasonCollector.observer, () => {
+      startCall("call-wrong-submission-cause");
+      emitAttempt({
+        callId: "call-wrong-submission-cause",
+        ordinal: 1,
+        transport: "websocket",
+        outcome: "failed",
+      });
+      emitTransportFallback({
+        callId: "call-wrong-submission-cause",
+        fromTransport: "websocket",
+        toTransport: "sse",
+        reason: "submission_failure",
+        eventId: "wrong-submission-cause",
+      });
+      emitTransportFallback({
+        callId: "call-wrong-submission-cause",
+        fromTransport: "websocket",
+        toTransport: "sse",
+        reason: "stream_failure",
+        eventId: "valid-stream-cause",
+      });
+      emitAttempt({
+        callId: "call-wrong-submission-cause",
+        ordinal: 2,
+        reason: "transport_fallback",
+        transport: "sse",
+        outcome: "completed",
+      });
+      observeProviderTransportLogicalCallSettled("call-wrong-submission-cause", "completed");
+    });
+
+    expect(wrongReasonCollector.project()).toMatchObject({
+      coverage: { state: "partial", reasons: expect.arrayContaining(["transport_invalid_fact"]) },
+      snapshot: {
+        logicalCalls: { completed: 1 },
+        attempts: { total: 2, transportFallbacks: 1 },
+        fallbacks: { total: 1, submissionFailures: 0, streamFailures: 1 },
+      },
+    });
+
+    const noMutationCollector = createProviderTransportAccountingCollector();
+    runWithProviderTransportAccountingObserver(noMutationCollector.observer, () => {
+      startCall("call-rejected-fallback-route");
+      emitTransportFallback({
+        callId: "call-rejected-fallback-route",
+        fromTransport: "websocket",
+        toTransport: "sse",
+        reason: "connection_failure",
+        eventId: "rejected-missing-cause",
+      });
+      emitTransportFallback({
+        callId: "call-rejected-fallback-route",
+        fromTransport: "http2",
+        toTransport: "sse",
+        reason: "policy",
+        eventId: "valid-policy-fallback",
+      });
+      emitAttempt({
+        callId: "call-rejected-fallback-route",
+        ordinal: 1,
+        reason: "transport_fallback",
+        transport: "sse",
+        outcome: "completed",
+      });
+      observeProviderTransportLogicalCallSettled("call-rejected-fallback-route", "completed");
+    });
+
+    expect(noMutationCollector.project()).toMatchObject({
+      snapshot: {
+        logicalCalls: { completed: 1 },
+        attempts: { total: 1, transportFallbacks: 1 },
+        fallbacks: { total: 1, policy: 1 },
+      },
+    });
+  });
+
+  it("rejects failure fallbacks without their causal source event", () => {
+    const collector = createProviderTransportAccountingCollector();
+    runWithProviderTransportAccountingObserver(collector.observer, () => {
+      startCall("call-missing-fallback-cause");
+      emitTransportFallback({
+        callId: "call-missing-fallback-cause",
+        fromTransport: "websocket",
+        toTransport: "sse",
+        reason: "connection_failure",
+      });
+    });
+
+    expect(collector.project()).toMatchObject({
+      coverage: {
+        state: "partial",
+        reasons: expect.arrayContaining(["transport_invalid_fact"]),
+      },
+      snapshot: {
+        connections: { total: 0, totalKind: "lower_bound" },
+        fallbacks: { total: 0, totalKind: "lower_bound" },
+        events: { total: 0, totalKind: "lower_bound" },
+      },
+    });
+
+    const streamCollector = createProviderTransportAccountingCollector();
+    runWithProviderTransportAccountingObserver(streamCollector.observer, () => {
+      startCall("call-missing-stream-cause");
+      emitConnection({
+        callId: "call-missing-stream-cause",
+        ordinal: 1,
+        transport: "websocket",
+        outcome: "completed",
+      });
+      emitTransportFallback({
+        callId: "call-missing-stream-cause",
+        fromTransport: "websocket",
+        toTransport: "sse",
+        reason: "stream_failure",
+      });
+    });
+
+    expect(streamCollector.project()).toMatchObject({
+      coverage: {
+        state: "partial",
+        reasons: expect.arrayContaining(["transport_invalid_fact"]),
+      },
+      snapshot: {
+        attempts: { total: 0, totalKind: "lower_bound" },
+        fallbacks: { total: 0, totalKind: "lower_bound" },
       },
     });
   });
@@ -548,6 +791,13 @@ describe("provider transport accounting transitions", () => {
     const collector = createProviderTransportAccountingCollector();
     runWithProviderTransportAccountingObserver(collector.observer, () => {
       startCall("call-server-target", ANTHROPIC_ROUTE);
+      emitConnection({
+        callId: "call-server-target",
+        ordinal: 1,
+        transport: "websocket",
+        route: ANTHROPIC_ROUTE,
+        outcome: "failed",
+      });
       observeProviderTransportEvent({
         type: "fallback",
         eventId: "anthropic-transport-fallback",
@@ -718,7 +968,6 @@ describe("provider transport accounting transitions", () => {
   });
 
   it("accepts the planned PR6B pre-send OpenAI fallback contract fixture", () => {
-    // The audited PR6B branch does not emit this planned restack contract yet.
     const collector = createProviderTransportAccountingCollector();
     runWithProviderTransportAccountingObserver(collector.observer, () => {
       startCall("call-pr6b-pre");
@@ -792,26 +1041,22 @@ describe("provider transport accounting transitions", () => {
     // The audited PR6C branch does not emit this planned restack contract yet.
     const collector = createProviderTransportAccountingCollector();
     runWithProviderTransportAccountingObserver(collector.observer, () => {
-      startCall("call-pr6c", ANTHROPIC_ROUTE);
-      emitAttempt({
-        callId: "call-pr6c",
-        ordinal: 1,
-        route: ANTHROPIC_ROUTE,
-        outcome: "failed",
-      });
+      const callId = "call-pr6c";
+      startCall(callId, ANTHROPIC_ROUTE);
+      emitAttempt({ callId, ordinal: 1, route: ANTHROPIC_ROUTE, outcome: "failed" });
       emitServerFallback({
-        callId: "call-pr6c",
+        callId,
         fromModel: "claude-fable-5",
         toModel: "claude-opus-4-8",
       });
       emitAttempt({
-        callId: "call-pr6c",
+        callId,
         ordinal: 2,
         reason: "retry",
         route: ANTHROPIC_ROUTE,
         outcome: "completed",
       });
-      observeProviderTransportLogicalCallSettled("call-pr6c", "completed");
+      observeProviderTransportLogicalCallSettled(callId, "completed");
     });
 
     expect(collector.project()).toMatchObject({

@@ -4,11 +4,29 @@ import { getAiTransportHost, type AiProviderRequestPolicyInput } from "../host.j
 export function buildGuardedModelFetch(
   model: Model,
   timeoutMs?: number,
-  options?: { sanitizeSse?: boolean },
+  options?: {
+    sanitizeSse?: boolean;
+    onFetchDispatch?: () => void;
+  },
 ): typeof fetch {
   const host = getAiTransportHost();
   if (options !== undefined) {
-    return host.buildModelFetch(model, timeoutMs, options) ?? globalThis.fetch;
+    const guardedFetch = host.buildModelFetch(model, timeoutMs, options);
+    if (guardedFetch) {
+      return guardedFetch;
+    }
+    if (options.onFetchDispatch) {
+      return async (input, init) => {
+        const dispatched = globalThis.fetch(input, init);
+        try {
+          options.onFetchDispatch?.();
+        } catch {
+          // Accounting is observational and must never alter provider behavior.
+        }
+        return await dispatched;
+      };
+    }
+    return globalThis.fetch;
   }
   if (timeoutMs !== undefined) {
     return host.buildModelFetch(model, timeoutMs) ?? globalThis.fetch;

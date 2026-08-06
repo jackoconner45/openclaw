@@ -914,14 +914,17 @@ describe("fetchWithSsrFGuard hardening", () => {
 
   it("enforces hostname allowlist policies", async () => {
     const fetchImpl = vi.fn();
+    const onFetchDispatch = vi.fn();
     await expect(
       fetchWithSsrFGuard({
         url: "https://evil.example.org/file.txt",
         fetchImpl,
+        onFetchDispatch,
         policy: { hostnameAllowlist: ["cdn.example.com", "*.assets.example.com"] },
       }),
     ).rejects.toThrow(/allowlist/i);
     expect(fetchImpl).not.toHaveBeenCalled();
+    expect(onFetchDispatch).not.toHaveBeenCalled();
   });
 
   it("does not let wildcard allowlists match the apex host", async () => {
@@ -970,12 +973,14 @@ describe("fetchWithSsrFGuard hardening", () => {
       .mockResolvedValueOnce(okResponse("redirected"));
     process.on("unhandledRejection", onUnhandledRejection);
     let result: Awaited<ReturnType<typeof fetchWithSsrFGuard>> | undefined;
+    const onFetchDispatch = vi.fn();
 
     try {
       result = await fetchWithSsrFGuard({
         url: "https://api.example.com/start",
         fetchImpl,
         lookupFn: createPublicLookup(),
+        onFetchDispatch,
       });
 
       const reader = result.response.body?.getReader();
@@ -991,6 +996,7 @@ describe("fetchWithSsrFGuard hardening", () => {
         reader.releaseLock();
       }
       expect(cancel).toHaveBeenCalledOnce();
+      expect(onFetchDispatch).toHaveBeenCalledOnce();
       await new Promise<void>((resolve) => {
         setImmediate(resolve);
       });
@@ -1000,6 +1006,44 @@ describe("fetchWithSsrFGuard hardening", () => {
       process.off("unhandledRejection", onUnhandledRejection);
       expect(process.listeners("unhandledRejection")).not.toContain(onUnhandledRejection);
     }
+  });
+
+  it("does not let a throwing dispatch observer block the network fetch", async () => {
+    const fetchImpl = vi.fn(async () => okResponse());
+    const onFetchDispatch = vi.fn(() => {
+      throw new Error("observer failure");
+    });
+
+    const result = await fetchWithSsrFGuard({
+      url: "https://api.example.com/data",
+      fetchImpl,
+      lookupFn: createPublicLookup(),
+      onFetchDispatch,
+    });
+
+    expect(onFetchDispatch).toHaveBeenCalledOnce();
+    expect(fetchImpl).toHaveBeenCalledOnce();
+    expect(result.response.status).toBe(200);
+    await result.release();
+  });
+
+  it("does not report dispatch when the fetch invocation throws synchronously", async () => {
+    const fetchImpl = vi.fn(() => {
+      throw new Error("fetch invocation failed");
+    });
+    const onFetchDispatch = vi.fn();
+
+    await expect(
+      fetchWithSsrFGuard({
+        url: "https://api.example.com/data",
+        fetchImpl,
+        lookupFn: createPublicLookup(),
+        onFetchDispatch,
+      }),
+    ).rejects.toThrow("fetch invocation failed");
+
+    expect(fetchImpl).toHaveBeenCalledOnce();
+    expect(onFetchDispatch).not.toHaveBeenCalled();
   });
 
   it("strips sensitive headers when redirect crosses origins", async () => {
