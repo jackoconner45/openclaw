@@ -1,6 +1,6 @@
 // Anthropic provider tests cover stream events, tools, and message mapping.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { configureAiTransportHost } from "../host.js";
+import { configureAiTransportHost, type AiModelTransportEvent } from "../host.js";
 import type { Context, Model, Tool } from "../types.js";
 import { SYSTEM_PROMPT_CACHE_BOUNDARY } from "../utils/system-prompt-cache-boundary.js";
 
@@ -395,6 +395,42 @@ describe("Anthropic provider", () => {
     });
     expect(result.usage.cost.input).toBeCloseTo(0.00006, 10);
     expect(result.usage.cost.total).toBeGreaterThan(0);
+  });
+
+  it("leaves injected Anthropic clients uninstrumented", async () => {
+    const events: AiModelTransportEvent[] = [];
+    const client = createAnthropicSseClient([
+      {
+        type: "message_start",
+        message: {
+          id: "msg_injected",
+          model: "claude-sonnet-4-6",
+          usage: { input_tokens: 1, output_tokens: 0 },
+        },
+      },
+      {
+        type: "message_delta",
+        delta: { stop_reason: "end_turn" },
+        usage: { input_tokens: 1, output_tokens: 1 },
+      },
+      { type: "message_stop" },
+    ]);
+    configureAiTransportHost({
+      observeModelTransportEvent: (event) => events.push(event),
+    });
+
+    const result = await streamAnthropic(
+      makeAnthropicModel(),
+      { messages: [{ role: "user", content: "hello", timestamp: 0 }] },
+      {
+        apiKey: "sk-ant-provider",
+        client: client as never,
+        requestId: "call-injected",
+      },
+    ).result();
+
+    expect(result.stopReason).toBe("stop");
+    expect(events).toEqual([]);
   });
 
   it("prices reported 1-hour cache writes at twice the input rate", async () => {

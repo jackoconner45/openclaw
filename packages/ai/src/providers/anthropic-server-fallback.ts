@@ -25,7 +25,7 @@ export type AnthropicFallbackBoundary = {
   toModel: string | null;
 };
 
-function resolveFallbackModelIdentity(modelId: string | null): string | null {
+export function resolveAnthropicFallbackModelIdentity(modelId: string | null): string | null {
   if (!modelId?.trim()) {
     return null;
   }
@@ -53,8 +53,8 @@ export function resolveAnthropicFallbackServingModelCost(params: {
   servingModelId: string | null;
   requestedCost: Model["cost"];
 }): Model["cost"] {
-  const requestedModelId = resolveFallbackModelIdentity(params.requestedModelId);
-  const servingModelId = resolveFallbackModelIdentity(params.servingModelId);
+  const requestedModelId = resolveAnthropicFallbackModelIdentity(params.requestedModelId);
+  const servingModelId = resolveAnthropicFallbackModelIdentity(params.servingModelId);
   if (
     !servingModelId ||
     servingModelId === requestedModelId ||
@@ -104,12 +104,33 @@ export function applyAnthropicFallbackBoundary(params: {
   boundary: AnthropicFallbackBoundary;
   provider: string;
 }): void {
-  const { output, boundary } = params;
+  const { output } = params;
+  applyAnthropicFallbackContentBoundary(output);
+  applyAnthropicFallbackServingModel(params);
+}
+
+/** Drops pre-fallback executable content while retaining the continuation text prefix. */
+export function applyAnthropicFallbackContentBoundary(output: {
+  content: Array<{ type: string }>;
+}): void {
   const survivors = output.content.filter((block) => block.type === "text");
   for (const survivor of survivors) {
     delete (survivor as { textSignature?: string }).textSignature;
   }
   output.content.splice(0, output.content.length, ...survivors);
+}
+
+/** Records one authoritative serving-model transition without rewriting content. */
+export function applyAnthropicFallbackServingModel(params: {
+  output: {
+    content: Array<{ type: string }>;
+    responseModel?: string;
+    diagnostics?: AssistantMessageDiagnostic[];
+  };
+  boundary: AnthropicFallbackBoundary;
+  provider: string;
+}): void {
+  const { output, boundary } = params;
   if (boundary.toModel) {
     output.responseModel = boundary.toModel;
   }

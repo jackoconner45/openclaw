@@ -6,7 +6,10 @@ import {
   type Model,
 } from "@openclaw/ai";
 import { registerBuiltInApiProviders } from "@openclaw/ai/providers";
-import { createOpenAIResponsesTransportStreamFn } from "@openclaw/ai/transports";
+import {
+  createAnthropicMessagesTransportStreamFn,
+  createOpenAIResponsesTransportStreamFn,
+} from "@openclaw/ai/transports";
 import type { StreamFn } from "openclaw/plugin-sdk/agent-core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import "../../../llm/ai-transport-host.js";
@@ -44,6 +47,19 @@ const chatGptModel = {
   baseUrl: "https://chatgpt.test/backend-api",
 } satisfies Model<"openai-chatgpt-responses">;
 
+const anthropicModel = {
+  id: "claude-fable-5",
+  name: "Claude Fable 5",
+  api: "anthropic-messages",
+  provider: "anthropic",
+  baseUrl: "https://api.anthropic.test",
+  reasoning: true,
+  input: ["text"],
+  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+  contextWindow: 200_000,
+  maxTokens: 32_000,
+} satisfies Model<"anthropic-messages">;
+
 function createJwt(): string {
   const encode = (value: object) => Buffer.from(JSON.stringify(value)).toString("base64url");
   return `${encode({ alg: "none", typ: "JWT" })}.${encode({
@@ -79,6 +95,18 @@ function wrapOpenAIStream(callId: string): StreamFn {
     model: model.id,
     api: model.api,
     transport: "responses-sdk",
+    trace: createDiagnosticTraceContext(),
+    nextCallId: () => callId,
+  });
+}
+
+function wrapAnthropicStream(callId: string): StreamFn {
+  return wrapStreamFnWithDiagnosticModelCallEvents(createAnthropicMessagesTransportStreamFn(), {
+    runId: `run-${callId}`,
+    provider: anthropicModel.provider,
+    model: anthropicModel.id,
+    api: anthropicModel.api,
+    transport: "sse",
     trace: createDiagnosticTraceContext(),
     nextCallId: () => callId,
   });
@@ -128,6 +156,81 @@ describe("OpenAI producer to transport collector integration", () => {
           initial: 1,
           retries: 1,
         },
+        events: { total: 2, totalKind: "exact", entriesTruncated: false },
+      },
+    });
+  });
+
+  it("conserves Anthropic server fallback as one attempt plus one serving transition", async () => {
+    const response = new Response(
+      [
+        {
+          type: "message_start",
+          message: {
+            id: "msg_fallback",
+            model: "claude-fable-5",
+            usage: { input_tokens: 2, output_tokens: 0 },
+          },
+        },
+        {
+          type: "message_delta",
+          delta: { stop_reason: "end_turn" },
+          usage: {
+            input_tokens: 2,
+            output_tokens: 1,
+            iterations: [
+              {
+                type: "fallback_message",
+                model: "claude-opus-5",
+                input_tokens: 2,
+                output_tokens: 1,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+              },
+            ],
+          },
+        },
+        { type: "message_stop" },
+      ]
+        .map((event) => `data: ${JSON.stringify(event)}\n\n`)
+        .join(""),
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    );
+    configureAiTransportHost({
+      ...initialHost,
+      buildModelFetch: (_model, _timeout, options) => async () => {
+        options?.onFetchDispatch?.();
+        return await Promise.resolve(response);
+      },
+      resolveProviderEndpointClass: () => "anthropic-public",
+    });
+    const collector = createProviderTransportAccountingCollector();
+    const wrapped = wrapAnthropicStream("call-anthropic-fallback");
+
+    await runWithProviderTransportAccountingObserver(collector.observer, async () => {
+      await drain(
+        await wrapped(anthropicModel, context, {
+          apiKey: "test-key",
+        }),
+      );
+    });
+
+    expect(collector.project()).toMatchObject({
+      coverage: { state: "complete" },
+      snapshot: {
+        logicalCalls: {
+          total: 1,
+          completed: 1,
+          entries: [
+            {
+              callId: "call-anthropic-fallback",
+              transport: "sse",
+              servingModel: "claude-opus-5",
+            },
+          ],
+        },
+        attempts: { total: 1, initial: 1, retries: 0, totalKind: "exact" },
+        providerFallbacks: { total: 1, server: 1, totalKind: "exact" },
         events: { total: 2, totalKind: "exact", entriesTruncated: false },
       },
     });

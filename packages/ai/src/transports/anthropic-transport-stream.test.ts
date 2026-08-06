@@ -10,6 +10,7 @@ import {
   configureAiTransportHost,
   getAiTransportHost,
   type AiInlineContentBlock,
+  type AiModelTransportEvent,
 } from "../host.js";
 
 const { buildGuardedModelFetchMock, guardedFetchMock } = vi.hoisted(() => ({
@@ -352,7 +353,7 @@ describe("anthropic transport stream", () => {
         };
       },
     });
-    guardedFetchMock.mockResolvedValue(createSseResponse());
+    guardedFetchMock.mockResolvedValue(createSseResponse([{ type: "message_stop" }]));
   });
 
   afterEach(() => {
@@ -842,6 +843,7 @@ describe("anthropic transport stream", () => {
       { type: "text", text: "partial " },
       { type: "text", text: "continued" },
     ]);
+
     expect(result.responseModel).toBe("claude-opus-4-8");
     expect(result.diagnostics).toEqual([
       expect.objectContaining({
@@ -856,6 +858,250 @@ describe("anthropic transport stream", () => {
     // Fallback-served turns bill at the serving model's rates, not Fable's:
     // 5 input tokens at $5/MTok plus 9 output tokens at $25/MTok.
     expect(result.usage.cost.total).toBeCloseTo(0.00025, 10);
+  });
+
+  it("records one completed native attempt after guarded egress and terminal EOF", async () => {
+    const events: AiModelTransportEvent[] = [];
+    guardedFetchMock.mockResolvedValueOnce(
+      createSseResponse([
+        {
+          type: "message_start",
+          message: {
+            id: "msg_accounted",
+            model: "claude-sonnet-4-6",
+            usage: { input_tokens: 1, output_tokens: 0 },
+          },
+        },
+        {
+          type: "message_delta",
+          delta: { stop_reason: "end_turn" },
+          usage: { input_tokens: 1, output_tokens: 1 },
+        },
+        { type: "message_stop" },
+      ]),
+    );
+    configureAiTransportHost({
+      ...getAiTransportHost(),
+      buildModelFetch: (_model, _timeout, options) => async (input, init) => {
+        options?.onFetchDispatch?.();
+        return await guardedFetchMock(input, init);
+      },
+      observeModelTransportEvent: (event) => events.push(event),
+    });
+
+    const result = await runTransportStream(
+      makeAnthropicTransportModel(),
+      { messages: [{ role: "user", content: "hello" }] } as AnthropicStreamContext,
+      {
+        apiKey: "sk-ant-api",
+        requestId: "call-native-complete",
+      } as AnthropicStreamOptions,
+    );
+
+    expect(result.stopReason).toBe("stop");
+    expect(events).toEqual([
+      expect.objectContaining({
+        type: "attempt",
+        callId: "call-native-complete",
+        ordinal: 1,
+        reason: "initial",
+        outcome: "completed",
+        statusCode: 200,
+      }),
+    ]);
+  });
+
+  it("records one failed native attempt when EOF arrives before message_stop", async () => {
+    const events: AiModelTransportEvent[] = [];
+    guardedFetchMock.mockResolvedValueOnce(
+      createSseResponse([
+        {
+          type: "message_start",
+          message: {
+            id: "msg_incomplete_accounting",
+            model: "claude-sonnet-4-6",
+            usage: { input_tokens: 1, output_tokens: 0 },
+          },
+        },
+        {
+          type: "content_block_start",
+          index: 0,
+          content_block: { type: "text", text: "" },
+        },
+        {
+          type: "content_block_delta",
+          index: 0,
+          delta: { type: "text_delta", text: "partial" },
+        },
+      ]),
+    );
+    configureAiTransportHost({
+      ...getAiTransportHost(),
+      buildModelFetch: (_model, _timeout, options) => async (input, init) => {
+        options?.onFetchDispatch?.();
+        return await guardedFetchMock(input, init);
+      },
+      observeModelTransportEvent: (event) => events.push(event),
+    });
+
+    const result = await runTransportStream(
+      makeAnthropicTransportModel(),
+      { messages: [{ role: "user", content: "hello" }] } as AnthropicStreamContext,
+      {
+        apiKey: "sk-ant-api",
+        requestId: "call-native-incomplete",
+      } as AnthropicStreamOptions,
+    );
+
+    expect(result.stopReason).toBe("error");
+    expect(result.errorMessage).toBe("Anthropic stream ended before message_stop");
+    expect(events).toEqual([
+      expect.objectContaining({
+        type: "attempt",
+        callId: "call-native-incomplete",
+        ordinal: 1,
+        outcome: "failed",
+        statusCode: 200,
+      }),
+    ]);
+  });
+
+  it.each([
+    {
+      label: "rejects direct EOF after a mapped stop reason",
+      model: makeAnthropicTransportModel(),
+      events: [
+        {
+          type: "message_delta",
+          delta: { stop_reason: "end_turn" },
+          usage: { input_tokens: 1, output_tokens: 1 },
+        },
+      ],
+      expectedStopReason: "error",
+    },
+    {
+      label: "rejects official-endpoint EOF through a provider alias",
+      model: makeAnthropicTransportModel({
+        provider: "provider-alias",
+        baseUrl: "https://api.anthropic.com",
+      }),
+      events: [
+        {
+          type: "message_delta",
+          delta: { stop_reason: "end_turn" },
+          usage: { input_tokens: 1, output_tokens: 1 },
+        },
+      ],
+      expectedStopReason: "error",
+    },
+    {
+      label: "accepts compatible EOF after a mapped stop reason",
+      model: makeAnthropicTransportModel({ baseUrl: "https://compatible.example" }),
+      events: [
+        {
+          type: "message_delta",
+          delta: { stop_reason: "end_turn" },
+          usage: { input_tokens: 1, output_tokens: 1 },
+        },
+      ],
+      expectedStopReason: "stop",
+    },
+    {
+      label: "rejects compatible partial EOF without a stop reason",
+      model: makeAnthropicTransportModel({ baseUrl: "https://compatible.example" }),
+      events: [
+        {
+          type: "content_block_delta",
+          index: 0,
+          delta: { type: "text_delta", text: "partial" },
+        },
+      ],
+      expectedStopReason: "error",
+    },
+    {
+      label: "accepts direct message_stop",
+      model: makeAnthropicTransportModel(),
+      events: [{ type: "message_stop" }],
+      expectedStopReason: "stop",
+    },
+  ])("$label", async ({ model, events, expectedStopReason }) => {
+    guardedFetchMock.mockResolvedValueOnce(createSseResponse(events));
+
+    const result = await runTransportStream(
+      model,
+      { messages: [{ role: "user", content: "hello" }] } as AnthropicStreamContext,
+      { apiKey: "sk-ant-api" } as AnthropicStreamOptions,
+    );
+
+    expect(result.stopReason).toBe(expectedStopReason);
+    if (expectedStopReason === "error") {
+      expect(result.errorMessage).toBe("Anthropic stream ended before message_stop");
+    }
+  });
+
+  it("records no-boundary server fallback without adding an attempt", async () => {
+    const events: AiModelTransportEvent[] = [];
+    guardedFetchMock.mockResolvedValueOnce(
+      createSseResponse([
+        {
+          type: "message_start",
+          message: {
+            id: "msg_no_boundary",
+            model: "claude-fable-5",
+            usage: { input_tokens: 5, output_tokens: 0 },
+          },
+        },
+        {
+          type: "message_delta",
+          delta: { stop_reason: "end_turn" },
+          usage: {
+            input_tokens: 5,
+            output_tokens: 2,
+            iterations: [
+              {
+                type: "fallback_message",
+                model: "claude-opus-5",
+                input_tokens: 5,
+                output_tokens: 2,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+              },
+            ],
+          },
+        },
+        { type: "message_stop" },
+      ]),
+    );
+    configureAiTransportHost({
+      ...getAiTransportHost(),
+      buildModelFetch: (_model, _timeout, options) => async (input, init) => {
+        options?.onFetchDispatch?.();
+        return await guardedFetchMock(input, init);
+      },
+      observeModelTransportEvent: (event) => events.push(event),
+    });
+
+    const result = await runTransportStream(
+      makeAnthropicTransportModel({ id: "claude-fable-5", name: "Claude Fable 5" }),
+      { messages: [{ role: "user", content: "hello" }] } as AnthropicStreamContext,
+      {
+        apiKey: "sk-ant-api",
+        requestId: "call-native-fallback",
+      } as AnthropicStreamOptions,
+    );
+
+    expect(result.responseModel).toBe("claude-opus-5");
+    expect(result.diagnostics).toEqual([
+      expect.objectContaining({
+        type: "provider_fallback",
+        details: {
+          provider: "anthropic",
+          fromModel: "claude-fable-5",
+          toModel: "claude-opus-5",
+        },
+      }),
+    ]);
+    expect(events.map((event) => event.type)).toEqual(["provider_fallback", "attempt"]);
   });
 
   it("records and prices a pre-output server-side fallback boundary", async () => {
@@ -1766,6 +2012,7 @@ describe("anthropic transport stream", () => {
           delta: { stop_reason: "tool_use" },
           usage: { input_tokens: 10, output_tokens: 5 },
         },
+        { type: "message_stop" },
       ]),
     );
 
@@ -1817,6 +2064,7 @@ describe("anthropic transport stream", () => {
           delta: { stop_reason: "tool_use" },
           usage: { input_tokens: 10, output_tokens: 5 },
         },
+        { type: "message_stop" },
       ]),
     );
     const model = makeAnthropicTransportModel({
@@ -2171,7 +2419,7 @@ describe("anthropic transport stream", () => {
     {
       label: "the stream ends before content_block_stop",
       response: () => createSseResponse(createInterruptedThinkingEvents()),
-      stopReason: "stop",
+      stopReason: "error",
     },
     {
       label: "the provider errors before content_block_stop",
@@ -2321,6 +2569,7 @@ describe("anthropic transport stream", () => {
           delta: { stop_reason: "end_turn" },
           usage: { input_tokens: 6, output_tokens: 2 },
         },
+        { type: "message_stop" },
       ]),
     );
     const model = makeAnthropicTransportModel({
@@ -2538,6 +2787,7 @@ describe("anthropic transport stream", () => {
           delta: { stop_reason: "end_turn" },
           usage: { input_tokens: 6, output_tokens: 1 },
         },
+        { type: "message_stop" },
       ]),
     );
     const streamFn = createAnthropicMessagesTransportStreamFn();
