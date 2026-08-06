@@ -1474,7 +1474,7 @@ describe("agentCommand – LiveSessionModelSwitchError retry", () => {
         assistantTurns: { state: "complete" },
         usage: { state: "partial", reasons: ["partial_usage"] },
         tools: { state: "complete" },
-        providerTransport: { state: "unavailable", reasons: ["not_instrumented"] },
+        providerTransport: { state: "unavailable", reasons: ["not_observed"] },
       },
     });
     expect(state.bindAgentCommandRunAccountingMock.mock.invocationCallOrder.at(-1)).toBeGreaterThan(
@@ -2407,7 +2407,7 @@ describe("agentCommand – LiveSessionModelSwitchError retry", () => {
         },
         providerTransport: {
           state: "unavailable",
-          reasons: ["not_instrumented", "post_turn_compaction"],
+          reasons: ["not_observed", "unknown_runtime", "post_turn_compaction"],
         },
       },
     });
@@ -2443,7 +2443,10 @@ describe("agentCommand – LiveSessionModelSwitchError retry", () => {
     const [, accountingSnapshot] = state.bindAgentCommandRunAccountingMock.mock.calls.at(-1) ?? [];
     expect(accountingSnapshot).toMatchObject({
       coverage: {
-        providerTransport: { state: "unavailable", reasons: ["not_instrumented"] },
+        providerTransport: {
+          state: "unavailable",
+          reasons: ["not_observed", "unknown_runtime"],
+        },
       },
     });
     expect(state.deliverAgentCommandResultMock).toHaveBeenCalledTimes(1);
@@ -4609,6 +4612,7 @@ describe("agentCommand – LiveSessionModelSwitchError retry", () => {
   it("classifies empty embedded run results before model fallback accepts them", async () => {
     let observedClassification: unknown;
     let winningOwner: CodeModeActivityOwner | undefined;
+    const diagnosticCallIds: string[] = [];
     state.runWithModelFallbackMock.mockImplementation(async (params: FallbackRunnerParams) => {
       const primaryResult = await params.run(params.provider, params.model);
       observedClassification = await params.classifyResult?.({
@@ -4638,14 +4642,18 @@ describe("agentCommand – LiveSessionModelSwitchError retry", () => {
       .mockImplementationOnce(async (attemptParams: unknown) => {
         const attempt = attemptParams as {
           commandRunAccounting: { readonly codeModeActivityOwner: CodeModeActivityOwner };
+          allocateDiagnosticModelCallId: () => string;
         };
+        diagnosticCallIds.push(attempt.allocateDiagnosticModelCallId());
         registerCodeModeRunActivity(attempt.commandRunAccounting.codeModeActivityOwner);
         return makeEmptyResult("anthropic", "claude");
       })
       .mockImplementationOnce(async (attemptParams: unknown) => {
         const attempt = attemptParams as {
           commandRunAccounting: { readonly codeModeActivityOwner: CodeModeActivityOwner };
+          allocateDiagnosticModelCallId: () => string;
         };
+        diagnosticCallIds.push(attempt.allocateDiagnosticModelCallId());
         winningOwner = attempt.commandRunAccounting.codeModeActivityOwner;
         return makeSuccessResult("openai", "gpt-5.4");
       });
@@ -4657,6 +4665,10 @@ describe("agentCommand – LiveSessionModelSwitchError retry", () => {
       code: "empty_result",
     });
     expect(state.runAgentAttemptMock).toHaveBeenCalledTimes(2);
+    expect(diagnosticCallIds).toHaveLength(2);
+    expect(new Set(diagnosticCallIds).size).toBe(2);
+    expect(diagnosticCallIds[0]).toMatch(/:model:1$/);
+    expect(diagnosticCallIds[1]).toMatch(/:model:2$/);
     expectRecordFields(mockCallArg(state.runAgentAttemptMock, 1), {
       providerOverride: "openai",
       modelOverride: "gpt-5.4",

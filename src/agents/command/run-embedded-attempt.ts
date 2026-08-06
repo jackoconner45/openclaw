@@ -210,12 +210,12 @@ export async function runEmbeddedAgentAttempt(params: {
     params.opts.replyChannel ?? params.opts.channel,
   );
 
-  let result: AgentAttemptResult;
+  let result: AgentAttemptResult, terminal: EmbeddedAgentRunEntryTerminal;
   let fallbackProvider = provider,
     fallbackModel = model;
   let fallbackExhausted = false,
-    liveSwitchRetries = 0;
-  let terminal: EmbeddedAgentRunEntryTerminal;
+    liveSwitchRetries = 0,
+    modelCallSequence = 0;
   let autoFallbackPrimaryProbeInterruptedByLiveSwitch = false;
   const fastModeStartedAtMs = Date.now();
   const fallbackTrajectoryRecorder = createTrajectoryRuntimeRecorder({
@@ -477,6 +477,7 @@ export async function runEmbeddedAgentAttempt(params: {
               timeoutMs,
               runTimeoutOverrideMs,
               runId,
+              allocateDiagnosticModelCallId: () => `${runId}:model:${++modelCallSequence}`,
               lifecycleGeneration,
               opts: params.opts,
               runContext,
