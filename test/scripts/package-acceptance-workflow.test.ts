@@ -3852,7 +3852,21 @@ describe("package artifact reuse", () => {
     const summaryJob = workflowJob(FULL_RELEASE_VALIDATION_WORKFLOW, "summary");
     const evidenceReuseStep = workflowStep(evidenceReuseJob, "Find reusable validation evidence");
     const dispatchStep = workflowStep(npmTelegramJob, "Dispatch and monitor npm Telegram E2E");
+    const modeStep = workflowStep(summaryJob, "Select Gateway/node compatibility mode");
+    const collectorCheckout = workflowStep(
+      summaryJob,
+      "Checkout Gateway/node compatibility collector",
+    );
+    const collectorStep = workflowStep(summaryJob, "Collect Gateway/node compatibility evidence");
     const manifestStep = workflowStep(summaryJob, "Write release validation manifest");
+    const manifestUpload = workflowStep(summaryJob, "Upload release validation manifest");
+    const legacyManifestUpload = workflowStep(
+      summaryJob,
+      "Upload legacy release validation manifest alias",
+    );
+    const manifestRun = manifestStep.run ?? "";
+    const manifestArtifactPath =
+      "${{ runner.temp }}/full-release-validation/full-release-validation-manifest.json";
 
     expect(workflow).toContain("CHILD_WORKFLOW_REF: ${{ github.ref_name }}");
     expect(workflow).toContain('gh workflow run "$workflow" --ref "$CHILD_WORKFLOW_REF" "$@" 2>&1');
@@ -3892,6 +3906,37 @@ describe("package artifact reuse", () => {
       SCENARIO: "${{ inputs.npm_telegram_scenario }}",
       TARGET_SHA: "${{ needs.resolve_target.outputs.sha }}",
     });
+    expect(collectorCheckout.if).toContain("needs.release_checks.outputs.run_id != ''");
+    expect(collectorCheckout.if).toContain(
+      'contains(fromJSON(\'["all","release-checks","cross-os"]\'), inputs.rerun_group)',
+    );
+    expect(collectorCheckout.with).toMatchObject({
+      path: "workflow",
+      ref: "${{ github.sha }}",
+    });
+    expect(collectorStep.env).toMatchObject({
+      GH_TOKEN: "${{ github.token }}",
+      RELEASE_CHECKS_RUN_ID: "${{ needs.release_checks.outputs.run_id }}",
+      TARGET_SHA: "${{ needs.resolve_target.outputs.sha }}",
+    });
+    expectTextToIncludeAll(collectorStep.run, [
+      "gateway-node-compat-release-evidence.mjs collect",
+      '--workflow-sha "${GITHUB_SHA}"',
+      '--target-sha "${TARGET_SHA}"',
+      '--mode "${GATEWAY_NODE_COMPAT_MODE}"',
+    ]);
+    expect(modeStep.env).toEqual({
+      RERUN_GROUP: "${{ inputs.rerun_group }}",
+      WORKFLOW_FULL_REF: "${{ github.ref }}",
+    });
+    expectTextToIncludeAll(modeStep.run, [
+      'mode="not-selected"',
+      "all | release-checks | cross-os)",
+      '[[ "$WORKFLOW_FULL_REF" == refs/heads/tideclaw/alpha/* ]]',
+      'mode="advisory"',
+      'mode="required"',
+      '"GATEWAY_NODE_COMPAT_MODE=${mode}"',
+    ]);
     expect(manifestStep.env).toMatchObject({
       ALLOW_UNRELEASED_CHANGELOG:
         "${{ inputs.allow_unreleased_changelog || (inputs.target_context_ref == '' && (inputs.ref == 'main' || inputs.ref == 'refs/heads/main')) }}",
@@ -3899,7 +3944,25 @@ describe("package artifact reuse", () => {
       NPM_TELEGRAM_PROVIDER_MODE: "${{ inputs.npm_telegram_provider_mode }}",
       NPM_TELEGRAM_SCENARIO: "${{ inputs.npm_telegram_scenario }}",
     });
-    expectTextToIncludeAll(manifestStep.run, [
+    expectTextToIncludeAll(manifestRun, [
+      '--slurpfile gatewayNodeCompatibility "$GATEWAY_NODE_COMPAT_PATH"',
+      "gatewayNodeCompatibility: $gatewayNodeCompatibilityMode",
+      "{gatewayNodeCompatibility: $gatewayNodeCompatibility[0]}",
+    ]);
+    const reuseManifestBranch = manifestRun.slice(
+      manifestRun.indexOf('if [[ "$EVIDENCE_REUSE" == "true" ]]'),
+      manifestRun.indexOf("exit 0"),
+    );
+    expect(reuseManifestBranch).not.toContain("gatewayNodeCompatibility");
+    expect(reuseManifestBranch).toContain(
+      '"${manifest_dir}/full-release-validation-manifest.json"',
+    );
+    for (const uploadStep of [manifestUpload, legacyManifestUpload]) {
+      expect(uploadStep.uses).toBe(UPLOAD_ARTIFACT_V7);
+      expect(uploadStep.with?.path).toBe(manifestArtifactPath);
+      expect(uploadStep.with?.path).not.toContain("gateway-node-compatibility.json");
+    }
+    expectTextToIncludeAll(manifestRun, [
       "npmTelegramPackageSpec: $npmTelegramPackageSpec",
       "npmTelegramProviderMode: $npmTelegramProviderMode",
       "npmTelegramScenario: $npmTelegramScenario",

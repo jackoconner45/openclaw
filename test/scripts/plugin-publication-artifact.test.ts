@@ -377,6 +377,7 @@ function createFixture(
       total_count: 1,
       jobs: [
         {
+          id: 9001,
           name: PRODUCER_JOB_NAME,
           run_id: RUN_ID,
           run_attempt: RUN_ATTEMPT,
@@ -885,6 +886,7 @@ describe("plugin publication artifact", () => {
         total_count: 1,
         jobs: [
           {
+            id: 9000 + producerAttempt,
             name: producerJobName,
             run_id: RUN_ID,
             run_attempt: producerAttempt,
@@ -949,6 +951,113 @@ describe("plugin publication artifact", () => {
     );
     await expect(downloadForAttempts(3, 2)).rejects.toThrow(
       "Producer workflow run attempt must not be newer than the consumer attempt.",
+    );
+  });
+
+  it("paginates completed producer jobs and fails closed on incomplete or duplicate inventories", async () => {
+    const zip = createZip([{ bytes: Buffer.from("proof"), name: "proof.txt" }]);
+    const producerJobName = "Gateway/node compatibility / Linux x64";
+    const artifactMetadata = {
+      digest: `sha256:${sha256(zip)}`,
+      expired: false,
+      id: ARTIFACT_ID,
+      name: ARTIFACT_NAME,
+      size_in_bytes: zip.length,
+      workflow_run: { head_sha: WORKFLOW_SHA, id: RUN_ID },
+    };
+    const workflowRun = {
+      conclusion: "failure",
+      event: "workflow_dispatch",
+      head_branch: "main",
+      head_repository: { full_name: REPOSITORY },
+      head_sha: WORKFLOW_SHA,
+      id: RUN_ID,
+      path: WORKFLOW_PATH,
+      repository: { full_name: REPOSITORY },
+      run_attempt: RUN_ATTEMPT,
+      status: "completed",
+    };
+
+    async function downloadWithSecondPage(mode: "duplicate" | "incomplete" | "valid") {
+      const firstPage = Array.from({ length: 100 }, (_unused, index) => ({
+        conclusion: "success",
+        head_sha: WORKFLOW_SHA,
+        id: index + 1,
+        name: `decoy-${index}`,
+        run_attempt: RUN_ATTEMPT,
+        run_id: RUN_ID,
+        status: "completed",
+      }));
+      const secondPage =
+        mode === "incomplete"
+          ? []
+          : [
+              {
+                conclusion: "success",
+                head_sha: WORKFLOW_SHA,
+                id: mode === "duplicate" ? 1 : 101,
+                name: producerJobName,
+                run_attempt: RUN_ATTEMPT,
+                run_id: RUN_ID,
+                status: "completed",
+              },
+            ];
+      const fetchImpl = (async (input: string | URL | Request) => {
+        const url = String(input);
+        if (url.endsWith(`/actions/artifacts/${ARTIFACT_ID}`)) {
+          return Response.json(artifactMetadata);
+        }
+        if (url.endsWith(`/actions/runs/${RUN_ID}/attempts/${RUN_ATTEMPT}`)) {
+          return Response.json(workflowRun);
+        }
+        if (url.endsWith(`/actions/runs/${RUN_ID}/attempts/${RUN_ATTEMPT}/jobs?per_page=100`)) {
+          return Response.json({ jobs: firstPage, total_count: 101 });
+        }
+        if (
+          url.endsWith(`/actions/runs/${RUN_ID}/attempts/${RUN_ATTEMPT}/jobs?per_page=100&page=2`)
+        ) {
+          return Response.json({ jobs: secondPage, total_count: 101 });
+        }
+        if (url.endsWith(`/actions/artifacts/${ARTIFACT_ID}/zip`)) {
+          return new Response(zip as unknown as BodyInit, {
+            headers: { "content-length": String(zip.length) },
+            status: 200,
+          });
+        }
+        return new Response("unexpected", { status: 404 });
+      }) as typeof fetch;
+
+      return downloadActionsArtifactArchive({
+        expected: {
+          artifactDigest: artifactMetadata.digest,
+          artifactId: ARTIFACT_ID,
+          artifactName: ARTIFACT_NAME,
+          artifactSizeBytes: zip.length,
+          producerJobName,
+          repository: REPOSITORY,
+          runAttempt: RUN_ATTEMPT,
+          runId: RUN_ID,
+          runStatePolicy: "completed-producer-success",
+          workflowEvent: "workflow_dispatch",
+          workflowHeadBranch: "main",
+          workflowPath: WORKFLOW_PATH,
+          workflowSha: WORKFLOW_SHA,
+        },
+        fetchImpl,
+        maxArchiveBytes: 1024 * 1024,
+        retryAttempts: 1,
+        token: "test-token",
+      });
+    }
+
+    await expect(downloadWithSecondPage("valid")).resolves.toMatchObject({
+      workflowJobs: { total_count: 101 },
+    });
+    await expect(downloadWithSecondPage("incomplete")).rejects.toThrow(
+      "Actions workflow jobs inventory is incomplete.",
+    );
+    await expect(downloadWithSecondPage("duplicate")).rejects.toThrow(
+      "duplicate or invalid job IDs",
     );
   });
 
