@@ -22,6 +22,10 @@ import { readAttemptTerminal } from "./attempt-terminal.test-helper.js";
 import { CodexAppServerRpcError } from "./client.js";
 import { nativeHookRelayUnregisterQueue } from "./native-hook-relay-state.js";
 import {
+  codexNativeHookRelayLeaseTesting,
+  createCodexNativeHookRelay,
+} from "./native-hook-relay.js";
+import {
   createParams,
   createResumeHarness,
   createStartedThreadHarness,
@@ -47,6 +51,33 @@ const testing = {
     nativeHookRelayUnregisterQueue.flush();
   },
 };
+
+function createDirectCodexNativeHookRelay(ttlMs: number, generation?: string) {
+  const params = createParams(
+    path.join(tempDir, "direct-relay-session.jsonl"),
+    path.join(tempDir, "direct-relay-workspace"),
+  );
+  const relay = createCodexNativeHookRelay({
+    options: { enabled: true, ttlMs },
+    ...(generation ? { generation } : {}),
+    events: ["pre_tool_use"],
+    agentId: "main",
+    sessionId: params.sessionId,
+    sessionKey: params.sessionKey,
+    config: params.config,
+    runId: params.runId,
+    attemptTimeoutMs: 5_000,
+    startupTimeoutMs: 5_000,
+    turnStartTimeoutMs: 5_000,
+    loopDetectionPreToolUseRelay: true,
+    signal: new AbortController().signal,
+    onPreToolUseFailure: vi.fn(),
+  });
+  if (!relay) {
+    throw new Error("Expected native hook relay");
+  }
+  return relay;
+}
 
 const DISABLED_CODEX_WEB_SEARCH_THREAD_CONFIG_FINGERPRINT = JSON.stringify({
   "features.standalone_web_search": false,
@@ -639,79 +670,6 @@ describe("runCodexAppServerAttempt native hook relay", () => {
     }
   });
 
-  it("keeps a replacement Codex native hook relay registered when prior cleanup is pending", async () => {
-    const sessionFile = path.join(tempDir, "session.jsonl");
-    const workspaceDir = path.join(tempDir, "workspace");
-    const firstHarness = createStartedThreadHarness();
-
-    const firstRun = runCodexAppServerAttempt(createParams(sessionFile, workspaceDir), {
-      nativeHookRelay: {
-        enabled: true,
-        events: ["pre_tool_use"],
-      },
-    });
-    await firstHarness.waitForMethod("turn/start");
-    await firstHarness.completeTurn({ threadId: "thread-1", turnId: "turn-1" });
-    await firstRun;
-
-    const firstStartRequest = firstHarness.requests.find(
-      (request) => request.method === "thread/start",
-    );
-    const firstRelayId = extractRelayIdFromThreadRequest(firstStartRequest?.params);
-    expect(nativeHookRelayTesting.getNativeHookRelayRegistrationForTests(firstRelayId)?.runId).toBe(
-      "run-1",
-    );
-    await expect(
-      invokeNativeHookRelay({
-        provider: "codex",
-        relayId: firstRelayId,
-        event: "pre_tool_use",
-        rawPayload: {
-          hook_event_name: "PreToolUse",
-          tool_name: "Bash",
-          tool_use_id: "late-call-1",
-          tool_input: { command: "python3 -c 'print(\"x\")'" },
-        },
-      }),
-    ).resolves.toMatchObject({ exitCode: 0 });
-
-    const secondHarness = createResumeHarness();
-    const secondParams = createParams(sessionFile, workspaceDir);
-    secondParams.runId = "run-2";
-    const secondRun = runCodexAppServerAttempt(secondParams, {
-      nativeHookRelay: {
-        enabled: true,
-        events: ["pre_tool_use"],
-      },
-    });
-    await secondHarness.waitForMethod("turn/start");
-
-    const resumeRequest = secondHarness.requests.find(
-      (request) => request.method === "thread/resume",
-    );
-    const secondRelayId = extractRelayIdFromThreadRequest(resumeRequest?.params);
-    expect(secondRelayId).toBe(firstRelayId);
-    const resumedRegistration =
-      nativeHookRelayTesting.getNativeHookRelayRegistrationForTests(firstRelayId);
-    expect(resumedRegistration?.runId).toBe("run-2");
-    expect(resumedRegistration?.allowedEvents).toEqual(["pre_tool_use"]);
-
-    testing.flushPendingCodexNativeHookRelayUnregistersForTests();
-    expect(nativeHookRelayTesting.getNativeHookRelayRegistrationForTests(firstRelayId)?.runId).toBe(
-      "run-2",
-    );
-
-    await secondHarness.completeTurn({ threadId: "thread-1", turnId: "turn-1" });
-    await secondRun;
-    expect(nativeHookRelayTesting.getNativeHookRelayRegistrationForTests(firstRelayId)?.runId).toBe(
-      "run-2",
-    );
-    testing.flushPendingCodexNativeHookRelayUnregistersForTests();
-    expect(
-      nativeHookRelayTesting.getNativeHookRelayRegistrationForTests(firstRelayId),
-    ).toBeUndefined();
-  });
-
   it("persists and reuses Codex native hook relay generations for resumed threads", async () => {
     const sessionFile = path.join(tempDir, "session.jsonl");
     const workspaceDir = path.join(tempDir, "workspace");
@@ -750,17 +708,25 @@ describe("runCodexAppServerAttempt native hook relay", () => {
     const resumeRequest = secondHarness.requests.find(
       (request) => request.method === "thread/resume",
     );
-    expect(extractRelayIdFromThreadRequest(resumeRequest?.params)).toBe(firstRelayId);
+    const secondRelayId = extractRelayIdFromThreadRequest(resumeRequest?.params);
+    expect(secondRelayId).not.toBe(firstRelayId);
     expect(extractGenerationFromThreadRequest(resumeRequest?.params)).toBe(firstGeneration);
+    expect(nativeHookRelayTesting.getNativeHookRelayRegistrationForTests(firstRelayId)?.runId).toBe(
+      "run-1",
+    );
+    expect(
+      nativeHookRelayTesting.getNativeHookRelayRegistrationForTests(secondRelayId)?.runId,
+    ).toBe("run-2");
 
     await secondHarness.completeTurn({ threadId: "thread-1", turnId: "turn-1" });
     await secondRun;
     testing.flushPendingCodexNativeHookRelayUnregistersForTests();
   });
 
-  it("accepts a stale first hook generation when resuming a pre-generation binding", async () => {
+  it("bootstraps stale generations only through the legacy relay alias", async () => {
     const sessionFile = path.join(tempDir, "session.jsonl");
     const workspaceDir = path.join(tempDir, "workspace");
+    const staleGeneration = "legacy-generation-from-running-thread";
     await writeCodexAppServerBinding(sessionFile, {
       threadId: "thread-existing",
       cwd: workspaceDir,
@@ -781,18 +747,63 @@ describe("runCodexAppServerAttempt native hook relay", () => {
     const resumeRequest = harness.requests.find((request) => request.method === "thread/resume");
     const relayId = extractRelayIdFromThreadRequest(resumeRequest?.params);
     const currentGeneration = extractGenerationFromThreadRequest(resumeRequest?.params);
-    expect(currentGeneration).not.toBe("legacy-generation-from-running-thread");
+    const registration = nativeHookRelayTesting.getNativeHookRelayRegistrationForTests(relayId);
+    if (!registration) {
+      throw new Error("Expected generation-scoped native hook relay registration");
+    }
+    const legacyRelayId = codexNativeHookRelayLeaseTesting.buildLegacyRelayId({
+      agentId: registration.agentId,
+      sessionId: registration.sessionId,
+      sessionKey: registration.sessionKey,
+    });
+
+    expect(currentGeneration).not.toBe(staleGeneration);
+    expect(legacyRelayId).not.toBe(relayId);
+    expect(
+      nativeHookRelayTesting.getNativeHookRelayRegistrationForTests(legacyRelayId),
+    ).toBeDefined();
     await expect(
       invokeNativeHookRelay({
         provider: "codex",
-        relayId,
-        generation: "legacy-generation-from-running-thread",
+        relayId: legacyRelayId,
+        generation: staleGeneration,
         event: "pre_tool_use",
         requireGeneration: true,
         rawPayload: {
           hook_event_name: "PreToolUse",
           tool_name: "Bash",
-          tool_use_id: "first-tool-after-restart",
+          tool_use_id: "legacy-first-tool-after-restart",
+          tool_input: { command: "pwd" },
+        },
+      }),
+    ).resolves.toMatchObject({ exitCode: 0 });
+    await expect(
+      invokeNativeHookRelay({
+        provider: "codex",
+        relayId: legacyRelayId,
+        generation: "different-legacy-generation",
+        event: "pre_tool_use",
+        requireGeneration: true,
+        rawPayload: {
+          hook_event_name: "PreToolUse",
+          tool_name: "Bash",
+          tool_use_id: "unexpected-legacy-generation",
+          tool_input: { command: "pwd" },
+        },
+      }),
+    ).rejects.toThrow("native hook relay bridge stale registration");
+
+    await expect(
+      invokeNativeHookRelay({
+        provider: "codex",
+        relayId,
+        generation: currentGeneration,
+        event: "pre_tool_use",
+        requireGeneration: true,
+        rawPayload: {
+          hook_event_name: "PreToolUse",
+          tool_name: "Bash",
+          tool_use_id: "current-generation-tool",
           tool_input: { command: "pwd" },
         },
       }),
@@ -801,13 +812,13 @@ describe("runCodexAppServerAttempt native hook relay", () => {
       invokeNativeHookRelay({
         provider: "codex",
         relayId,
-        generation: "different-legacy-generation",
+        generation: staleGeneration,
         event: "pre_tool_use",
         requireGeneration: true,
         rawPayload: {
           hook_event_name: "PreToolUse",
           tool_name: "Bash",
-          tool_use_id: "unexpected-stale-generation",
+          tool_use_id: "stale-generation-on-v2-route",
           tool_input: { command: "pwd" },
         },
       }),
@@ -819,18 +830,26 @@ describe("runCodexAppServerAttempt native hook relay", () => {
       currentGeneration,
     );
     testing.flushPendingCodexNativeHookRelayUnregistersForTests();
+    expect(
+      nativeHookRelayTesting.getNativeHookRelayRegistrationForTests(legacyRelayId),
+    ).toBeUndefined();
+    expect(nativeHookRelayTesting.getNativeHookRelayRegistrationForTests(relayId)).toBeUndefined();
   });
 
   it("rotates native hook relay generations when an existing binding starts a fresh thread", async () => {
     const sessionFile = path.join(tempDir, "session.jsonl");
     const workspaceDir = path.join(tempDir, "workspace");
+    const staleGeneration = "generation-from-stale-thread";
+    const oldRelay = createDirectCodexNativeHookRelay(60_000, staleGeneration);
+    const releaseOldChild = oldRelay.acquireChild("old-generation-child");
+    oldRelay.releaseParent({ delay: true });
     await writeCodexAppServerBinding(sessionFile, {
       threadId: "thread-existing",
       cwd: workspaceDir,
       model: "gpt-5.4-codex",
       modelProvider: "openai",
       userMcpServersFingerprint: "stale-user-mcp-fingerprint",
-      nativeHookRelayGeneration: "generation-from-stale-thread",
+      nativeHookRelayGeneration: staleGeneration,
     });
     const harness = createStartedThreadHarness();
 
@@ -845,12 +864,31 @@ describe("runCodexAppServerAttempt native hook relay", () => {
     const startRequest = harness.requests.find((request) => request.method === "thread/start");
     const relayId = extractRelayIdFromThreadRequest(startRequest?.params);
     const currentGeneration = extractGenerationFromThreadRequest(startRequest?.params);
-    expect(currentGeneration).not.toBe("generation-from-stale-thread");
+    expect(relayId).not.toBe(oldRelay.relayId);
+    expect(currentGeneration).not.toBe(staleGeneration);
+    expect(
+      nativeHookRelayTesting.getNativeHookRelayRegistrationForTests(oldRelay.relayId),
+    ).toBeDefined();
+    await expect(
+      invokeNativeHookRelay({
+        provider: "codex",
+        relayId: oldRelay.relayId,
+        generation: staleGeneration,
+        event: "pre_tool_use",
+        requireGeneration: true,
+        rawPayload: {
+          hook_event_name: "PreToolUse",
+          tool_name: "Bash",
+          tool_use_id: "old-generation-child-tool",
+          tool_input: { command: "pwd" },
+        },
+      }),
+    ).resolves.toEqual({ stdout: "", stderr: "", exitCode: 0 });
     await expect(
       invokeNativeHookRelay({
         provider: "codex",
         relayId,
-        generation: "generation-from-stale-thread",
+        generation: staleGeneration,
         event: "pre_tool_use",
         requireGeneration: true,
         rawPayload: {
@@ -868,6 +906,14 @@ describe("runCodexAppServerAttempt native hook relay", () => {
       currentGeneration,
     );
     testing.flushPendingCodexNativeHookRelayUnregistersForTests();
+    expect(
+      nativeHookRelayTesting.getNativeHookRelayRegistrationForTests(oldRelay.relayId),
+    ).toBeDefined();
+    releaseOldChild();
+    testing.flushPendingCodexNativeHookRelayUnregistersForTests();
+    expect(
+      nativeHookRelayTesting.getNativeHookRelayRegistrationForTests(oldRelay.relayId),
+    ).toBeUndefined();
   });
 
   it("rotates native hook relay generations when resume fails over to a fresh thread", async () => {

@@ -1,7 +1,6 @@
 import {
   embeddedAgentLog,
   type AgentHarnessRuntimeArtifactBinding,
-  type NativeHookRelayRegistrationHandle,
 } from "openclaw/plugin-sdk/agent-harness-runtime";
 import { resolveCodexStartupTimeoutMs } from "./attempt-timeouts.js";
 import type { CodexAppServerClient } from "./client.js";
@@ -14,6 +13,7 @@ import {
   CODEX_NATIVE_HOOK_RELAY_TTL_GRACE_MS,
   createCodexNativeHookRelay,
   emitCodexNativePreToolUseFailureDiagnostic,
+  type CodexNativeHookRelayLease,
   type CodexNativePreToolUseFailure,
 } from "./native-hook-relay.js";
 import { codexNativeSubagentMonitorRuntime } from "./native-subagent-monitor.js";
@@ -66,7 +66,7 @@ export function prepareCodexAttemptResources(prompt: CodexAttemptPrompt) {
     routeActivated: false,
     detachRouteAbort: (() => undefined) as () => void,
     trajectoryEndRecorded: false,
-    nativeHookRelay: undefined as NativeHookRelayRegistrationHandle | undefined,
+    nativeHookRelay: undefined as CodexNativeHookRelayLease | undefined,
     nativeSubagentMonitor: undefined as
       | ReturnType<typeof codexNativeSubagentMonitorRuntime.register>
       | undefined,
@@ -170,6 +170,7 @@ export function prepareCodexAttemptResources(prompt: CodexAttemptPrompt) {
       taskRuntimeScope: params.agentHarnessTaskRuntimeScope,
       agentId: sessionAgentId,
       retainClient: () => retainSharedCodexAppServerClientIfCurrent(state.client),
+      nativeHookRelay: state.nativeHookRelay,
     });
   };
   const releaseCurrentRoute = () => {

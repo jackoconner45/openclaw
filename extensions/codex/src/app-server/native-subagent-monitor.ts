@@ -13,6 +13,7 @@ import {
 } from "openclaw/plugin-sdk/agent-harness-task-runtime";
 import { asFiniteNumber, normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
 import type { CodexAppServerClient } from "./client.js";
+import type { CodexNativeHookRelayLease } from "./native-hook-relay.js";
 import {
   codexNativeSubagentNotifications as nativeSubagentNotifications,
   type CodexNativeSubagentCompletion,
@@ -49,6 +50,7 @@ type ParentState = {
   agentId?: string;
   taskRuntime?: AgentHarnessTaskRuntime;
   mirror?: CodexNativeSubagentTaskMirror;
+  nativeHookRelay?: CodexNativeHookRelayLease;
 };
 
 type ChildState = {
@@ -67,6 +69,8 @@ type ChildState = {
   deliveringCompletion: boolean;
   deliveryOwnerKey?: string;
   settledWithoutCompletion: boolean;
+  nativeHookRelayId?: string;
+  releaseNativeHookRelay?: () => void;
 };
 
 type ChildAssistantMessages = {
@@ -153,6 +157,7 @@ function registerMonitor(params: {
   agentId?: string;
   runtime?: NativeSubagentMonitorRuntime;
   retainClient?: () => (() => void) | undefined;
+  nativeHookRelay?: CodexNativeHookRelayLease;
 }): { unregister: () => void } {
   let monitor = monitors.get(params.client);
   if (!monitor) {
@@ -166,6 +171,7 @@ function registerMonitor(params: {
     requesterSessionKey: params.requesterSessionKey,
     taskRuntimeScope: params.taskRuntimeScope,
     agentId: params.agentId,
+    nativeHookRelay: params.nativeHookRelay,
   });
 }
 
@@ -247,6 +253,7 @@ class Monitor {
     requesterSessionKey?: string;
     taskRuntimeScope?: AgentHarnessTaskRuntimeScope;
     agentId?: string;
+    nativeHookRelay?: CodexNativeHookRelayLease;
   }): { unregister: () => void } {
     const parentThreadId = params.parentThreadId.trim();
     if (!parentThreadId) {
@@ -271,6 +278,7 @@ class Monitor {
     state.requesterSessionKey ??= params.requesterSessionKey;
     state.taskRuntimeScope ??= params.taskRuntimeScope;
     state.agentId ??= params.agentId;
+    state.nativeHookRelay = params.nativeHookRelay;
     this.prepareParentTaskRuntime(state);
     for (const childState of this.childStates.values()) {
       if (childState.parentThreadId === parentThreadId && childState.pendingCompletion) {
@@ -401,6 +409,10 @@ class Monitor {
     if (childState.terminal) {
       return;
     }
+    this.updateChildNativeHookRelay(
+      childState,
+      this.parentStates.get(childState.parentThreadId)?.nativeHookRelay,
+    );
     this.observeActiveChild(childState);
     this.clearRecoveryTimers(childState);
     childState.recoveryAttempt = 0;
@@ -858,6 +870,7 @@ class Monitor {
       return;
     }
     childState.terminal = true;
+    this.releaseChildNativeHookRelay(childState);
     this.clearRecoveryTimers(childState);
     state.mirror?.markAuthoritativeCompletion(completion.childThreadId);
     state.taskRuntime?.finalizeTaskRunByRunId({
@@ -1011,6 +1024,10 @@ class Monitor {
         deliveringCompletion: false,
       };
       this.childStates.set(childThreadId, childState);
+      this.updateChildNativeHookRelay(
+        childState,
+        this.parentStates.get(parentThreadId)?.nativeHookRelay,
+      );
       this.threadStatusRevisions.set(
         childThreadId,
         this.threadStatusRevisions.get(childThreadId) ?? { value: 0, readers: 0 },
@@ -1046,6 +1063,7 @@ class Monitor {
 
   private unregisterChild(childState: ChildState): void {
     this.clearRecoveryTimers(childState);
+    this.releaseChildNativeHookRelay(childState);
     if (childState.completionDeliveryTimer) {
       clearTimeout(childState.completionDeliveryTimer);
     }
@@ -1071,6 +1089,30 @@ class Monitor {
     if (state) {
       this.pruneParentIfUnused(state);
     }
+  }
+
+  private updateChildNativeHookRelay(
+    childState: ChildState,
+    relay: CodexNativeHookRelayLease | undefined,
+  ): void {
+    const relayId = relay?.relayId;
+    if (childState.nativeHookRelayId === relayId) {
+      return;
+    }
+    // Codex installs the current parent turn's hooks before child turn/started.
+    // Claim that route before releasing the inherited route so no tool can hit a gap.
+    const releaseNext = relay?.acquireChild(childState.childThreadId);
+    const releasePrevious = childState.releaseNativeHookRelay;
+    childState.nativeHookRelayId = relayId;
+    childState.releaseNativeHookRelay = releaseNext;
+    releasePrevious?.();
+  }
+
+  private releaseChildNativeHookRelay(childState: ChildState): void {
+    const release = childState.releaseNativeHookRelay;
+    childState.nativeHookRelayId = undefined;
+    childState.releaseNativeHookRelay = undefined;
+    release?.();
   }
 
   private releaseClientRetentionIfIdle(): void {
