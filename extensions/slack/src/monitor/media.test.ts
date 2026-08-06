@@ -27,6 +27,16 @@ type SaveMediaBufferMock = (
   originalFilename?: string,
 ) => Promise<SavedMedia>;
 type SlackMediaResult = NonNullable<Awaited<ReturnType<typeof resolveSlackMedia>>>;
+type ResolveSlackThreadStarterParams = Parameters<typeof resolveSlackThreadStarter>[0];
+
+function resolveTestSlackThreadStarter(
+  params: Omit<ResolveSlackThreadStarterParams, "workspaceScope">,
+) {
+  return resolveSlackThreadStarter({
+    ...params,
+    workspaceScope: { accountId: "test", teamId: "T1" },
+  });
+}
 
 function expectSlackMediaResult(
   result: Awaited<ReturnType<typeof resolveSlackMedia>>,
@@ -1637,7 +1647,7 @@ describe("resolveSlackThreadStarter", () => {
       conversations: { replies },
     } as unknown as Parameters<typeof resolveSlackThreadStarter>[0]["client"];
 
-    const result = await resolveSlackThreadStarter({
+    const result = await resolveTestSlackThreadStarter({
       channelId: "C1",
       threadTs: "1.000",
       client,
@@ -1659,7 +1669,7 @@ describe("resolveSlackThreadStarter", () => {
       conversations: { replies },
     } as unknown as Parameters<typeof resolveSlackThreadStarter>[0]["client"];
 
-    const result = await resolveSlackThreadStarter({
+    const result = await resolveTestSlackThreadStarter({
       channelId: "C1",
       threadTs: "1.000",
       client,
@@ -1690,7 +1700,7 @@ describe("resolveSlackThreadStarter", () => {
       conversations: { replies },
     } as unknown as Parameters<typeof resolveSlackThreadStarter>[0]["client"];
 
-    const result = await resolveSlackThreadStarter({
+    const result = await resolveTestSlackThreadStarter({
       channelId: "C1",
       threadTs: "1.000",
       client,
@@ -1731,7 +1741,7 @@ describe("resolveSlackThreadStarter", () => {
       conversations: { replies },
     } as unknown as Parameters<typeof resolveSlackThreadStarter>[0]["client"];
 
-    const result = await resolveSlackThreadStarter({
+    const result = await resolveTestSlackThreadStarter({
       channelId: "C1",
       threadTs: "1.000",
       client,
@@ -1755,7 +1765,7 @@ describe("resolveSlackThreadStarter", () => {
       conversations: { replies },
     } as unknown as Parameters<typeof resolveSlackThreadStarter>[0]["client"];
 
-    const result = await resolveSlackThreadStarter({
+    const result = await resolveTestSlackThreadStarter({
       channelId: "C1",
       threadTs: "1.000",
       client,
@@ -1777,7 +1787,7 @@ describe("resolveSlackThreadStarter", () => {
       conversations: { replies },
     } as unknown as Parameters<typeof resolveSlackThreadStarter>[0]["client"];
 
-    const result = await resolveSlackThreadStarter({
+    const result = await resolveTestSlackThreadStarter({
       channelId: "C42",
       threadTs: "9.999",
       client,
@@ -1796,7 +1806,7 @@ describe("resolveSlackThreadStarter", () => {
       conversations: { replies },
     } as unknown as Parameters<typeof resolveSlackThreadStarter>[0]["client"];
 
-    const result = await resolveSlackThreadStarter({
+    const result = await resolveTestSlackThreadStarter({
       channelId: "C1",
       threadTs: "1.000",
       client,
