@@ -1,0 +1,98 @@
+import { createHash } from "node:crypto";
+import fs from "node:fs/promises";
+import path from "node:path";
+import { resolveDefaultAgentId } from "../agents/agent-scope-config.js";
+import { resolveAgentEffectiveModelPrimary } from "../agents/agent-scope.js";
+import type { AuthProfileStore } from "../agents/auth-profiles.js";
+import {
+  readFrontierEvidencePolicyFile,
+  type FrontierEvidencePolicy,
+} from "../agents/frontier-evidence-policy.js";
+import { splitTrailingAuthProfile } from "../agents/model-ref-profile.js";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
+
+type FrontierEvidenceCliOptions = {
+  authEnvOnly?: boolean;
+  config?: string;
+  fallback?: string[];
+  frontierEvidencePolicy?: string;
+  frontierEvidencePolicySha256?: string;
+  isolated?: boolean;
+  model?: string;
+  thinking?: string;
+};
+
+export type FrontierEvidenceExecution = {
+  policy: FrontierEvidencePolicy;
+  authStore: AuthProfileStore;
+  authProfileId: string;
+  credentialEnvName: string;
+};
+
+export async function resolveFrontierEvidenceExecution(params: {
+  baseConfig: OpenClawConfig;
+  opts: FrontierEvidenceCliOptions;
+}): Promise<FrontierEvidenceExecution | undefined> {
+  const policyPath = params.opts.frontierEvidencePolicy?.trim();
+  const policySha256 = params.opts.frontierEvidencePolicySha256?.trim();
+  if (!policyPath && !policySha256) {
+    return undefined;
+  }
+  if (!policyPath || !policySha256 || !params.opts.config) {
+    throw new Error("frontier evidence policy requires a pinned config, path, and SHA-256");
+  }
+  if (
+    params.opts.isolated ||
+    params.opts.authEnvOnly ||
+    params.opts.model?.trim() ||
+    (params.opts.fallback?.length ?? 0) > 0
+  ) {
+    throw new Error("frontier evidence policy conflicts with runtime route overrides");
+  }
+
+  const policy = await readFrontierEvidencePolicyFile({
+    path: path.resolve(policyPath),
+    expectedSha256: policySha256,
+  });
+  const configSha256 = createHash("sha256")
+    .update(await fs.readFile(path.resolve(params.opts.config)))
+    .digest("hex");
+  if (configSha256 !== policy.configSha256) {
+    throw new Error("frontier evidence config SHA-256 mismatch");
+  }
+
+  const defaultAgentId = resolveDefaultAgentId(params.baseConfig);
+  if (defaultAgentId !== policy.defaultAgentId) {
+    throw new Error("frontier evidence default agent mismatch");
+  }
+  const configuredPrimary = resolveAgentEffectiveModelPrimary(params.baseConfig, defaultAgentId);
+  const qualified = splitTrailingAuthProfile(configuredPrimary ?? "");
+  if (qualified.model !== `${policy.provider}/${policy.model}` || !qualified.profile) {
+    throw new Error("frontier evidence configured model/profile mismatch");
+  }
+  if (params.opts.thinking !== policy.thinking) {
+    throw new Error("frontier evidence thinking level mismatch");
+  }
+
+  const credential = process.env[policy.credentialEnvName];
+  if (!credential?.trim()) {
+    throw new Error("frontier evidence credential environment is missing");
+  }
+  return {
+    policy,
+    authProfileId: qualified.profile,
+    credentialEnvName: policy.credentialEnvName,
+    authStore: {
+      version: 1,
+      profiles: {
+        [qualified.profile]: {
+          type: "api_key",
+          provider: "openai",
+          key: credential,
+        },
+      },
+      order: { openai: [qualified.profile] },
+      lastGood: { openai: qualified.profile },
+    },
+  };
+}

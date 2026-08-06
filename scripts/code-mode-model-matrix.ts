@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { execFile } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -9,21 +9,40 @@ import process from "node:process";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import {
+  isCloudModelRef,
+  parseModelCatalogRef,
+} from "@openclaw/model-catalog-core/model-catalog-refs";
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
+import JSON5 from "json5";
+import {
   buildScriptEvidenceSummary,
   QA_EVIDENCE_FILENAME,
   validateQaEvidenceSummaryJson,
   type QaEvidenceStatus,
   type QaEvidenceSummaryJson,
 } from "../extensions/qa-lab/api.js";
+import { resolveDefaultAgentDir, resolveDefaultAgentId } from "../src/agents/agent-scope-config.js";
+import { resolveAgentEffectiveModelPrimary } from "../src/agents/agent-scope.js";
+import { ensureAuthProfileStoreWithoutExternalProfiles } from "../src/agents/auth-profiles.js";
+import type { ApiKeyCredential } from "../src/agents/auth-profiles.js";
+import { hasAuthoredProviderRequestParams } from "../src/agents/model-extra-params.js";
+import { isLocalProviderBaseUrl } from "../src/agents/model-provider-local.js";
+import { splitTrailingAuthProfile } from "../src/agents/model-ref-profile.js";
+import { resolveModelRuntimePolicy } from "../src/agents/model-runtime-policy.js";
+import { resolveConfiguredModelFallbacks } from "../src/agents/model-selection-resolve.js";
 import type { AgentExecEnvelope } from "../src/commands/agent-exec.ts";
+import { createConfigIO } from "../src/config/io.js";
+import type { OpenClawConfig } from "../src/config/types.openclaw.js";
+import { isSecretRef, isValidEnvSecretRefId } from "../src/config/types.secrets.js";
+import { isValidSecretRef } from "../src/secrets/ref-contract.js";
 import { previewForDevToolLog, redactJsonValueForDevToolLog } from "./lib/dev-tooling-safety.ts";
 
 export { validateQaEvidenceSummaryJson };
 
 const execFileAsync = promisify(execFile);
 const SOURCE_PATH = "scripts/code-mode-model-matrix.ts";
-const MATRIX_SCHEMA_VERSION = 1;
-const DEFAULT_REPETITIONS = 3;
+const MATRIX_SCHEMA_VERSION = 2;
+const DEFAULT_REPETITIONS = 2;
 const DEFAULT_TIMEOUT_SECONDS = 180;
 const MAX_REPETITIONS = 10;
 const MAX_DIAGNOSTIC_CHARS = 8_000;
@@ -37,6 +56,7 @@ export type CodeModeMatrixOptions = {
   keepState: boolean;
   models: string[];
   modes: CodeModeMatrixMode[];
+  config?: string;
   outputDir?: string;
   repetitions: number;
   repoRoot: string;
@@ -55,7 +75,9 @@ type MatrixCell = {
 
 type MatrixTaskFixture = {
   expected: string;
+  fixtureSha256: string;
   prompt: string;
+  promptSha256: string;
   resultPath?: string;
 };
 
@@ -71,6 +93,7 @@ type CellFailureCategory =
   | "effect_mismatch"
   | "harness_error"
   | "model_mismatch"
+  | "proof_drift"
   | "provider_auth"
   | "provider_billing"
   | "provider_transport"
@@ -82,6 +105,7 @@ export type CodeModeMatrixCellResult = {
   bridgeCalls?: AgentExecEnvelope["bridgeCalls"];
   buildSha256: string;
   codeModeEngaged: boolean | null;
+  configSha256: string | null;
   costUsd?: number;
   diagnostics?: string;
   elapsedMs: number;
@@ -89,6 +113,7 @@ export type CodeModeMatrixCellResult = {
   expected: string;
   failureCategory: CellFailureCategory | null;
   final: string;
+  fixtureSha256: string;
   gitSha: string;
   id: string;
   mode: CodeModeMatrixMode;
@@ -103,6 +128,7 @@ export type CodeModeMatrixCellResult = {
     toolExecution: boolean;
   };
   passed: boolean;
+  promptSha256: string;
   repetition: number;
   sourceDirty: boolean;
   sourcePatchSha256: string | null;
@@ -116,11 +142,19 @@ export type CodeModeMatrixCellResult = {
 type RunCellParams = {
   buildSha256: string;
   cell: MatrixCell;
+  config?: unknown;
+  configPath?: string;
+  configSha256: string | null;
+  frozenEnv: NodeJS.ProcessEnv;
   gitSha: string;
   keepState: boolean;
   outputDir: string;
   repoRoot: string;
   runtime?: MatrixRuntimeEntrypoint;
+  frontierEvidencePolicy?: {
+    path: string;
+    sha256: string;
+  };
   sourceDirty: boolean;
   sourcePatchSha256: string | null;
   thinking: string;
@@ -133,6 +167,11 @@ type MatrixRunDependencies = {
   readBuildSha256?: (repoRoot: string) => Promise<string>;
   readGitSha?: (repoRoot: string) => Promise<string>;
   readSourceIdentity?: (repoRoot: string) => Promise<SourceIdentity>;
+  readAuthProfile?: (params: {
+    config: unknown;
+    profileId: string;
+    provider: string;
+  }) => Promise<MatrixAuthProfileObservation>;
   runCell?: (params: RunCellParams) => Promise<CodeModeMatrixCellResult>;
 };
 
@@ -142,13 +181,76 @@ type SourceIdentity = {
   sourcePatchSha256: string | null;
 };
 
+type PinnedConfigSnapshot = {
+  effective: OpenClawConfig | undefined;
+  parsed: unknown;
+  sha256: string | null;
+};
+
+type MatrixAuthProfileObservation = {
+  credentialEnvName?: string;
+  credentialValue?: string;
+  mode?: ApiKeyCredential["type"];
+  present: boolean;
+  provider?: string;
+};
+
+type MatrixExecutionPolicy = {
+  api: "openai-responses";
+  authMode: "api_key";
+  authBindingId: string;
+  cachePolicy: {
+    build: "shared_immutable";
+    os: "uncontrolled";
+    provider: "uncontrolled";
+  };
+  candidateRuntime: "embedded";
+  concurrency: 1;
+  credentialEnvName: "OPENAI_API_KEY";
+  defaultAgentId: string;
+  endpoint: "https://api.openai.com/v1";
+  environmentPolicySha256: string;
+  fallbacks: "disabled";
+  harnessRetries: 0;
+  model: string;
+  processState: "fresh_per_cell";
+  provider: "openai";
+  providerRetryPolicy: "openai-responses-runtime-default";
+  runtime: "openclaw";
+  schedule: "serial_abba";
+  seed: "unsupported_unset";
+  selectorSource: "config";
+  thinking: "high";
+};
+
+type MatrixPreflight = {
+  blockedReasons: string[];
+  credentialValue?: string;
+  executionPolicy?: MatrixExecutionPolicy;
+};
+
+const LOCAL_MODEL_PROVIDER_IDS = new Set([
+  "lmstudio",
+  "local",
+  "mlx",
+  "ollama",
+  "omlx-local",
+  "vllm",
+]);
+const LOCAL_PROVIDER_HOST_ALIASES = new Set([
+  "docker.orb.internal",
+  "host.docker.internal",
+  "host.orb.internal",
+]);
+
 function usage() {
   return `Usage: pnpm qa:code-mode-models -- --model <provider/model> [options]
 
 Runs repeated Code Mode acceptance cells through the normal embedded agent path.
 
 Options:
-  --model <provider/model>  Model reference; repeat for multiple models
+  --model <provider/model>  Assertion for the one configured frontier model
+  --config <path>           Pin one self-contained config file for auditable runs
   --mode <mode>             direct | auto | code; repeat to select modes
   --task <task>             read | dependent-read-write; repeat to select tasks
   --repetitions <n>         Runs per model/mode/task cell (default: ${DEFAULT_REPETITIONS}, max: ${MAX_REPETITIONS})
@@ -160,7 +262,7 @@ Options:
   --dry-run                 Write the manifest without calling models
   -h, --help                Show this help
 
-Provider credentials are read from the environment and are never written to artifacts.
+The frozen config selects one model@profile. Credential values are never written to artifacts.
 `;
 }
 
@@ -215,6 +317,7 @@ export function parseCodeModeMatrixOptions(
   let allowFailures = false;
   let dryRun = false;
   let keepState = false;
+  let config: string | undefined;
   let outputDir: string | undefined;
   let repetitions = DEFAULT_REPETITIONS;
   let thinking = "off";
@@ -242,6 +345,12 @@ export function parseCodeModeMatrixOptions(
     }
     if (arg === "--mode") {
       collectUnique(modes, parseMode(readOptionValue(argv, index, arg)), arg);
+      index += 1;
+      continue;
+    }
+    if (arg === "--config") {
+      recordOnce(arg);
+      config = path.resolve(cwd, readOptionValue(argv, index, arg));
       index += 1;
       continue;
     }
@@ -295,15 +404,16 @@ export function parseCodeModeMatrixOptions(
     throw new Error(`Unknown argument: ${arg}`);
   }
 
-  if (models.length === 0) {
-    throw new Error("At least one --model <provider/model> is required");
+  if (models.length !== 1) {
+    throw new Error("Exactly one --model <provider/model> is required");
   }
   return {
     allowFailures,
+    config,
     dryRun,
     keepState,
     models,
-    modes: modes.length > 0 ? modes : ["direct", "auto", "code"],
+    modes: modes.length > 0 ? modes : ["direct", "code"],
     outputDir,
     repetitions,
     repoRoot: path.resolve(cwd),
@@ -523,12 +633,40 @@ export async function reserveCodeModeMatrixOutputDir(
   }
 }
 
-function buildCells(options: CodeModeMatrixOptions): MatrixCell[] {
-  return options.models.flatMap((model) =>
-    options.modes.flatMap((mode) =>
+export function buildCodeModeMatrixCells(options: CodeModeMatrixOptions): MatrixCell[] {
+  if (
+    options.modes.length === 2 &&
+    options.modes[0] === "direct" &&
+    options.modes[1] === "code" &&
+    options.repetitions % 2 === 0
+  ) {
+    return options.models.flatMap((model) =>
       options.tasks.flatMap((task) =>
-        Array.from({ length: options.repetitions }, (_, index) => {
-          const repetition = index + 1;
+        Array.from({ length: options.repetitions / 2 }, (_, pairIndex) => {
+          const first = pairIndex * 2 + 1;
+          const second = first + 1;
+          return [
+            { mode: "direct" as const, repetition: first },
+            { mode: "code" as const, repetition: first },
+            { mode: "code" as const, repetition: second },
+            { mode: "direct" as const, repetition: second },
+          ].map(({ mode, repetition }) => ({
+            id: `${modelCellPrefix(model)}-${mode}-${task}-${repetition}`,
+            mode,
+            model,
+            repetition,
+            task,
+          }));
+        }).flat(),
+      ),
+    );
+  }
+  return options.models.flatMap((model) =>
+    options.tasks.flatMap((task) =>
+      Array.from({ length: options.repetitions }, (_, index) => {
+        const repetition = index + 1;
+        const modes = repetition % 2 === 1 ? options.modes : options.modes.toReversed();
+        return modes.map((mode) => {
           return {
             id: `${modelCellPrefix(model)}-${mode}-${task}-${repetition}`,
             mode,
@@ -536,8 +674,8 @@ function buildCells(options: CodeModeMatrixOptions): MatrixCell[] {
             repetition,
             task,
           };
-        }),
-      ),
+        });
+      }).flat(),
     ),
   );
 }
@@ -548,30 +686,48 @@ export function modelCellPrefix(model: string): string {
 }
 
 function verificationCode(cell: MatrixCell): string {
-  return `CM-${createHash("sha256").update(cell.id).digest("hex").slice(0, 12).toUpperCase()}`;
+  return `CM-${createHash("sha256")
+    .update(`${cell.model}\0${cell.task}`)
+    .digest("hex")
+    .slice(0, 12)
+    .toUpperCase()}`;
 }
 
-async function prepareTaskFixture(workspace: string, cell: MatrixCell): Promise<MatrixTaskFixture> {
+function taskFixtureText(cell: MatrixCell): string {
+  return `project=openclaw\nverification_code=${verificationCode(cell)}\n`;
+}
+
+function taskPrompt(task: CodeModeMatrixTask): string {
+  return task === "read"
+    ? "Read facts.txt using tools. Reply with only the verification_code value, with no prose or formatting."
+    : "Read facts.txt using tools. Write only its verification_code value to result.txt, then read result.txt and reply with only that value. Do not guess or skip verification.";
+}
+
+export async function prepareCodeModeMatrixTaskFixture(
+  workspace: string,
+  cell: MatrixCell,
+): Promise<MatrixTaskFixture> {
   const expected = verificationCode(cell);
+  const facts = taskFixtureText(cell);
   await fs.mkdir(workspace, { recursive: true });
-  await fs.writeFile(
-    path.join(workspace, "facts.txt"),
-    `project=openclaw\nverification_code=${expected}\n`,
-    "utf8",
-  );
+  await fs.writeFile(path.join(workspace, "facts.txt"), facts, "utf8");
+  const fixtureSha256 = createHash("sha256").update(facts).digest("hex");
+  const prompt = taskPrompt(cell.task);
   if (cell.task === "read") {
     return {
       expected,
-      prompt:
-        "Read facts.txt using tools. Reply with only the verification_code value, with no prose or formatting.",
+      fixtureSha256,
+      prompt,
+      promptSha256: createHash("sha256").update(prompt).digest("hex"),
     };
   }
   const resultPath = path.join(workspace, "result.txt");
   await fs.rm(resultPath, { force: true });
   return {
     expected,
-    prompt:
-      "Read facts.txt using tools. Write only its verification_code value to result.txt, then read result.txt and reply with only that value. Do not guess or skip verification.",
+    fixtureSha256,
+    prompt,
+    promptSha256: createHash("sha256").update(prompt).digest("hex"),
     resultPath,
   };
 }
@@ -584,7 +740,11 @@ async function readGitSha(repoRoot: string): Promise<string> {
   return stdout.trim();
 }
 
-async function readSourceIdentity(repoRoot: string): Promise<SourceIdentity> {
+function pathIsWithin(relativePath: string, relativeParent: string): boolean {
+  return relativePath === relativeParent || relativePath.startsWith(`${relativeParent}/`);
+}
+
+async function readSourceIdentity(repoRoot: string, outputDir?: string): Promise<SourceIdentity> {
   const gitSha = await readGitSha(repoRoot);
   const [{ stdout: patch }, { stdout: untrackedOutput }] = await Promise.all([
     execFileAsync("git", ["diff", "--binary", "HEAD", "--", "."], {
@@ -598,7 +758,14 @@ async function readSourceIdentity(repoRoot: string): Promise<SourceIdentity> {
       maxBuffer: 8 * 1024 * 1024,
     }),
   ]);
-  const untracked = untrackedOutput.split("\0").filter(Boolean).toSorted();
+  const outputRelative = outputDir
+    ? path.relative(path.resolve(repoRoot), path.resolve(outputDir)).split(path.sep).join("/")
+    : undefined;
+  const untracked = untrackedOutput
+    .split("\0")
+    .filter(Boolean)
+    .filter((relativePath) => !outputRelative || !pathIsWithin(relativePath, outputRelative))
+    .toSorted();
   const sourceDirty = patch.length > 0 || untracked.length > 0;
   if (!sourceDirty) {
     return { gitSha, sourceDirty: false, sourcePatchSha256: null };
@@ -620,6 +787,566 @@ async function readSourceIdentity(repoRoot: string): Promise<SourceIdentity> {
     sourceDirty: true,
     sourcePatchSha256: hash.digest("hex"),
   };
+}
+
+async function readPinnedConfigSnapshot(
+  configPath: string | undefined,
+): Promise<PinnedConfigSnapshot> {
+  if (!configPath) {
+    return { effective: undefined, parsed: undefined, sha256: null };
+  }
+  const stat = await fs.stat(configPath).catch((error: unknown) => {
+    throw new MatrixPreflightError("config_missing", { cause: error });
+  });
+  if (!stat.isFile()) {
+    throw new MatrixPreflightError("config_not_regular_file");
+  }
+  const raw = await fs.readFile(configPath);
+  let parsed: unknown;
+  try {
+    parsed = JSON5.parse(raw.toString("utf8"));
+  } catch (error) {
+    throw new MatrixPreflightError("config_parse_failed", { cause: error });
+  }
+  const inspectRaw = (
+    value: unknown,
+  ): {
+    envSubstitution: boolean;
+    include: boolean;
+  } => {
+    if (Array.isArray(value)) {
+      return value.reduce<{
+        envSubstitution: boolean;
+        include: boolean;
+      }>(
+        (result, entry) => {
+          const nested = inspectRaw(entry);
+          return {
+            envSubstitution: result.envSubstitution || nested.envSubstitution,
+            include: result.include || nested.include,
+          };
+        },
+        { envSubstitution: false, include: false },
+      );
+    }
+    if (isRecord(value)) {
+      return Object.entries(value).reduce<{
+        envSubstitution: boolean;
+        include: boolean;
+      }>(
+        (result, [key, entry]) => {
+          const nested = inspectRaw(entry);
+          return {
+            envSubstitution: result.envSubstitution || nested.envSubstitution,
+            include: result.include || key === "$include" || nested.include,
+          };
+        },
+        { envSubstitution: false, include: false },
+      );
+    }
+    return {
+      envSubstitution: typeof value === "string" && /\$\{[^}]+\}|\$[A-Z][A-Z0-9_]*/u.test(value),
+      include: false,
+    };
+  };
+  const rawInspection = inspectRaw(parsed);
+  if (rawInspection.include) {
+    throw new MatrixPreflightError("config_include_present");
+  }
+  if (
+    isRecord(parsed) &&
+    isRecord(parsed.env) &&
+    isRecord(parsed.env.shellEnv) &&
+    parsed.env.shellEnv.enabled === true
+  ) {
+    throw new MatrixPreflightError("config_shell_env_enabled");
+  }
+  if (isRecord(parsed) && isRecord(parsed.env)) {
+    const runtimeEnvEntries = Object.entries(parsed.env).filter(
+      ([key, value]) =>
+        (key === "vars" && isRecord(value) && Object.keys(value).length > 0) ||
+        (key !== "vars" && key !== "shellEnv" && typeof value === "string"),
+    );
+    if (runtimeEnvEntries.length > 0) {
+      throw new MatrixPreflightError("config_runtime_env_present");
+    }
+  }
+  if (rawInspection.envSubstitution) {
+    throw new MatrixPreflightError("config_env_substitution_present");
+  }
+  const configEnv = buildFrozenOperationalEnv(process.env);
+  let effective: OpenClawConfig;
+  try {
+    effective = createConfigIO({
+      configPath,
+      env: { ...configEnv },
+      observe: false,
+      shellEnvFallback: "defer",
+    }).loadConfig();
+  } catch (error) {
+    throw new MatrixPreflightError("config_effective_load_failed", { cause: error });
+  }
+  return {
+    effective,
+    parsed,
+    sha256: createHash("sha256").update(raw).digest("hex"),
+  };
+}
+
+class MatrixPreflightError extends Error {
+  readonly code: string;
+
+  constructor(code: string, options?: ErrorOptions) {
+    super(code, options);
+    this.name = "MatrixPreflightError";
+    this.code = code;
+  }
+}
+
+const MATRIX_OPERATIONAL_ENV_NAMES = [
+  "HOME",
+  "LANG",
+  "LOGNAME",
+  "PATH",
+  "SHELL",
+  "TEMP",
+  "TERM",
+  "TMP",
+  "TMPDIR",
+  "USER",
+] as const;
+
+const MATRIX_BLOCKED_ROUTE_ENV_NAMES = [
+  "ALL_PROXY",
+  "ANTHROPIC_BASE_URL",
+  "CODEX_API_KEY",
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "NO_PROXY",
+  "OPENAI_API_BASE",
+  "OPENAI_BASE_URL",
+  "OPENAI_OAUTH_TOKEN",
+  "all_proxy",
+  "http_proxy",
+  "https_proxy",
+  "no_proxy",
+] as const;
+
+function sha256Domain(label: string, value: string): string {
+  return createHash("sha256").update(`${label}\0${value}`).digest("hex");
+}
+
+function buildFrozenOperationalEnv(baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const name of MATRIX_OPERATIONAL_ENV_NAMES) {
+    if (baseEnv[name] !== undefined) {
+      env[name] = baseEnv[name];
+    }
+  }
+  for (const [name, value] of Object.entries(baseEnv)) {
+    if (name.startsWith("LC_") && value !== undefined) {
+      env[name] = value;
+    }
+  }
+  return env;
+}
+
+async function createFrontierEvidencePolicyFile(params: {
+  configSha256: string;
+  executionPolicy: MatrixExecutionPolicy;
+}): Promise<{
+  cleanup: () => Promise<void>;
+  path: string;
+  sha256: string;
+}> {
+  const parsedModel = parseModelCatalogRef(params.executionPolicy.model);
+  if (!parsedModel) {
+    throw new MatrixPreflightError("configured_model_mismatch");
+  }
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-frontier-policy-"));
+  const policyPath = path.join(root, "policy.json");
+  const policy = {
+    version: 1,
+    configSha256: params.configSha256,
+    defaultAgentId: params.executionPolicy.defaultAgentId,
+    provider: "openai",
+    model: parsedModel.modelId,
+    api: "openai-responses",
+    baseUrl: "https://api.openai.com/v1",
+    runtime: "openclaw",
+    authBindingId: params.executionPolicy.authBindingId,
+    credentialState: "frozen_in_memory",
+    credentialEnvName: params.executionPolicy.credentialEnvName,
+    fallbacks: "disabled",
+    proxy: "disabled",
+    tls: "default",
+    localService: "disabled",
+    endpoint: {
+      origin: "https://api.openai.com",
+      pathname: "/v1/responses",
+      method: "POST",
+      transport: "responses-sdk",
+    },
+    thinking: params.executionPolicy.thinking,
+    seed: "absent",
+    authoredRequestParams: "absent",
+    allowedRequestControls: [],
+  };
+  const raw = `${JSON.stringify(policy)}\n`;
+  await fs.writeFile(policyPath, raw, { encoding: "utf8", flag: "wx", mode: 0o600 });
+  await fs.chmod(policyPath, 0o600);
+  return {
+    cleanup: async () => await fs.rm(root, { recursive: true, force: true }),
+    path: policyPath,
+    sha256: createHash("sha256").update(raw).digest("hex"),
+  };
+}
+
+function readConfigPath(value: unknown, keys: readonly string[]): unknown {
+  let current = value;
+  for (const key of keys) {
+    if (!isRecord(current)) {
+      return undefined;
+    }
+    current = current[key];
+  }
+  return current;
+}
+
+async function readMatrixAuthProfile(params: {
+  config: unknown;
+  profileId: string;
+  provider: string;
+}): Promise<MatrixAuthProfileObservation> {
+  if (!isRecord(params.config)) {
+    return { present: false };
+  }
+  const agentDir = resolveDefaultAgentDir(params.config);
+  const store = ensureAuthProfileStoreWithoutExternalProfiles(agentDir, {
+    allowKeychainPrompt: false,
+    readOnly: true,
+    syncExternalCli: false,
+  });
+  const credential = store.profiles[params.profileId];
+  if (!credential) {
+    return { present: false };
+  }
+  if (
+    credential.type !== "api_key" ||
+    credential.provider !== "openai" ||
+    credential.key !== undefined ||
+    !isSecretRef(credential.keyRef) ||
+    !isValidSecretRef(credential.keyRef) ||
+    credential.keyRef.source !== "env" ||
+    credential.keyRef.provider !== "default" ||
+    !isValidEnvSecretRefId(credential.keyRef.id) ||
+    credential.keyRef.id !== "OPENAI_API_KEY"
+  ) {
+    return {
+      mode: credential.type === "api_key" ? credential.type : undefined,
+      present: true,
+      provider: credential.provider,
+    };
+  }
+  const credentialValue = process.env[credential.keyRef.id];
+  return {
+    credentialEnvName: credential.keyRef.id,
+    credentialValue,
+    mode: credential.type,
+    present: true,
+    provider: credential.provider,
+  };
+}
+
+function configuredAgentModel(config: unknown, model: string): Record<string, unknown> | undefined {
+  const models = readConfigPath(config, ["agents", "defaults", "models"]);
+  if (!isRecord(models)) {
+    return undefined;
+  }
+  const entry = models[model];
+  return isRecord(entry) ? entry : undefined;
+}
+
+function hasOnlyKeys(value: Record<string, unknown> | undefined, allowed: Set<string>): boolean {
+  return !value || Object.keys(value).every((key) => allowed.has(key));
+}
+
+function hasSelectedRouteMetadata(params: {
+  agentModel: Record<string, unknown> | undefined;
+  provider: Record<string, unknown> | undefined;
+  providerModel: Record<string, unknown> | undefined;
+}): boolean {
+  const runtime = isRecord(params.agentModel?.agentRuntime)
+    ? params.agentModel.agentRuntime
+    : undefined;
+  return (
+    !hasOnlyKeys(params.provider, new Set(["api", "auth", "baseUrl", "models"])) ||
+    !hasOnlyKeys(params.providerModel, new Set(["api", "baseUrl", "id"])) ||
+    !hasOnlyKeys(params.agentModel, new Set(["agentRuntime", "alias"])) ||
+    !hasOnlyKeys(runtime, new Set(["id"]))
+  );
+}
+
+async function evaluateMatrixPreflight(params: {
+  config: OpenClawConfig | undefined;
+  configSha256: string | null;
+  model: string;
+  modes: CodeModeMatrixMode[];
+  repetitions: number;
+  thinking: string;
+  authBindingId: string;
+  requireCredentialValue?: boolean;
+  readAuthProfile: NonNullable<MatrixRunDependencies["readAuthProfile"]>;
+}): Promise<MatrixPreflight> {
+  const reasons = new Set<string>();
+  if (!params.configSha256 || !isRecord(params.config)) {
+    reasons.add("config_missing");
+    return { blockedReasons: [...reasons] };
+  }
+  const parsedModel = parseModelCatalogRef(params.model);
+  if (!parsedModel || parsedModel.provider !== "openai") {
+    reasons.add("configured_model_mismatch");
+  }
+  if (
+    params.modes.length !== 2 ||
+    params.modes[0] !== "direct" ||
+    params.modes[1] !== "code" ||
+    params.repetitions % 2 !== 0
+  ) {
+    reasons.add("frontier_schedule_invalid");
+  }
+  if (params.thinking !== "high") {
+    reasons.add("thinking_level_not_comparable");
+  }
+  let defaultAgentId: string | undefined;
+  try {
+    defaultAgentId = resolveDefaultAgentId(params.config);
+  } catch {
+    reasons.add("default_agent_ambiguous");
+  }
+  const primaryValue = defaultAgentId
+    ? (resolveAgentEffectiveModelPrimary(params.config, defaultAgentId)?.trim() ?? "")
+    : "";
+  const qualified = splitTrailingAuthProfile(primaryValue);
+  if (!qualified.profile) {
+    reasons.add("auth_profile_unpinned");
+  }
+  if (qualified.model !== params.model) {
+    reasons.add("configured_model_mismatch");
+  }
+  const fallbacks = defaultAgentId
+    ? resolveConfiguredModelFallbacks({ cfg: params.config, agentId: defaultAgentId })
+    : [];
+  if (fallbacks.length !== 0) {
+    reasons.add("model_fallbacks_enabled");
+  }
+  const modelEntry = configuredAgentModel(params.config, params.model);
+  const providerConfig = configuredProvider(params.config, "openai");
+  const providerModels = Array.isArray(providerConfig?.models) ? providerConfig.models : [];
+  const providerModelEntry = providerModels.find(
+    (entry) => isRecord(entry) && entry.id === parsedModel?.modelId,
+  );
+  const resolvedProviderModel = isRecord(providerModelEntry) ? providerModelEntry : undefined;
+  const baseUrl = resolvedProviderModel?.baseUrl ?? providerConfig?.baseUrl;
+  if (baseUrl !== undefined && baseUrl !== "https://api.openai.com/v1") {
+    reasons.add("endpoint_not_canonical");
+  }
+  const api = resolvedProviderModel?.api ?? providerConfig?.api ?? "openai-responses";
+  if (api !== "openai-responses") {
+    reasons.add("api_not_openai_responses");
+  }
+  if (providerConfig?.auth !== undefined && providerConfig.auth !== "api-key") {
+    reasons.add("provider_auth_not_api_key");
+  }
+  if (
+    hasSelectedRouteMetadata({
+      agentModel: modelEntry,
+      provider: providerConfig,
+      providerModel: resolvedProviderModel,
+    })
+  ) {
+    reasons.add("selected_route_override_present");
+  }
+  if (
+    [providerConfig, resolvedProviderModel, modelEntry].some(
+      (entry) =>
+        entry &&
+        ["authHeader", "headers", "localService", "params", "proxy", "request", "tls"].some(
+          (key) => entry[key] !== undefined,
+        ),
+    )
+  ) {
+    reasons.add("provider_route_override_present");
+  }
+  if (
+    defaultAgentId &&
+    hasAuthoredProviderRequestParams({
+      config: params.config,
+      provider: "openai",
+      modelId: parsedModel?.modelId,
+      agentId: defaultAgentId,
+    })
+  ) {
+    reasons.add("request_params_present");
+  }
+  const containsSeed = (value: unknown): boolean =>
+    isRecord(value) && (Object.hasOwn(value, "seed") || Object.values(value).some(containsSeed));
+  if (containsSeed(params.config.agents?.defaults?.params) || containsSeed(providerConfig)) {
+    reasons.add("seed_present");
+  }
+  if (defaultAgentId && parsedModel) {
+    const runtimePolicy = resolveModelRuntimePolicy({
+      provider: "openai",
+      modelId: parsedModel.modelId,
+      config: params.config,
+      agentId: defaultAgentId,
+    });
+    if (runtimePolicy.policy?.id !== "openclaw") {
+      reasons.add("runtime_policy_not_openclaw");
+    }
+  }
+  const profileConfig = qualified.profile
+    ? readConfigPath(params.config, ["auth", "profiles", qualified.profile])
+    : undefined;
+  if (
+    !isRecord(profileConfig) ||
+    profileConfig.provider !== "openai" ||
+    profileConfig.mode !== "api_key"
+  ) {
+    reasons.add("configured_auth_profile_mismatch");
+  }
+
+  let authObservation: MatrixAuthProfileObservation = {
+    present: false,
+  };
+  let authReadFailed = false;
+  if (qualified.profile) {
+    try {
+      authObservation = await params.readAuthProfile({
+        config: params.config,
+        profileId: qualified.profile,
+        provider: "openai",
+      });
+    } catch {
+      authReadFailed = true;
+      reasons.add("auth_profile_read_failed");
+    }
+    if (!authReadFailed) {
+      if (!authObservation.present) {
+        reasons.add("stored_auth_profile_missing");
+      }
+      if (authObservation.provider !== "openai" || authObservation.mode !== "api_key") {
+        reasons.add("stored_auth_profile_mismatch");
+      }
+      if (authObservation.credentialEnvName !== "OPENAI_API_KEY") {
+        reasons.add("auth_profile_not_env_keyref");
+      }
+      if (params.requireCredentialValue !== false && !authObservation.credentialValue?.trim()) {
+        reasons.add("credential_environment_missing");
+      }
+    }
+  }
+
+  const allowedCredentials = new Set(
+    authObservation.credentialEnvName ? [authObservation.credentialEnvName] : [],
+  );
+  for (const name of MATRIX_BLOCKED_ROUTE_ENV_NAMES) {
+    if (process.env[name]?.trim() && !allowedCredentials.has(name)) {
+      reasons.add("provider_route_override_present");
+    }
+  }
+  if (
+    reasons.size > 0 ||
+    !qualified.profile ||
+    !parsedModel ||
+    !defaultAgentId ||
+    authObservation.credentialEnvName !== "OPENAI_API_KEY" ||
+    (params.requireCredentialValue !== false && !authObservation.credentialValue)
+  ) {
+    return { blockedReasons: [...reasons].toSorted() };
+  }
+
+  const environmentPolicy = {
+    credentialEnvName: "OPENAI_API_KEY",
+    operationalEnvNames: [...MATRIX_OPERATIONAL_ENV_NAMES],
+  };
+  return {
+    blockedReasons: [],
+    credentialValue: authObservation.credentialValue,
+    executionPolicy: {
+      api: "openai-responses",
+      authMode: "api_key",
+      authBindingId: params.authBindingId,
+      cachePolicy: {
+        build: "shared_immutable",
+        os: "uncontrolled",
+        provider: "uncontrolled",
+      },
+      candidateRuntime: "embedded",
+      concurrency: 1,
+      credentialEnvName: "OPENAI_API_KEY",
+      defaultAgentId,
+      endpoint: "https://api.openai.com/v1",
+      environmentPolicySha256: sha256Domain(
+        "openclaw-code-mode-matrix-env-v2",
+        JSON.stringify(environmentPolicy),
+      ),
+      fallbacks: "disabled",
+      harnessRetries: 0,
+      model: params.model,
+      processState: "fresh_per_cell",
+      provider: "openai",
+      providerRetryPolicy: "openai-responses-runtime-default",
+      runtime: "openclaw",
+      schedule: "serial_abba",
+      seed: "unsupported_unset",
+      selectorSource: "config",
+      thinking: "high",
+    },
+  };
+}
+
+function configuredProvider(
+  config: unknown,
+  providerId: string,
+): Record<string, unknown> | undefined {
+  if (!isRecord(config) || !isRecord(config.models) || !isRecord(config.models.providers)) {
+    return undefined;
+  }
+  const provider = config.models.providers[providerId];
+  return isRecord(provider) ? provider : undefined;
+}
+
+function isLocalEndpoint(value: unknown): boolean {
+  return typeof value === "string" && isLocalProviderBaseUrl(value, LOCAL_PROVIDER_HOST_ALIASES);
+}
+
+function hasLocalProviderProvenance(provider: Record<string, unknown> | undefined): boolean {
+  if (!provider) {
+    return false;
+  }
+  return isRecord(provider.localService) || isLocalEndpoint(provider.baseUrl);
+}
+
+export function classifyCodeModeMatrixModel(
+  model: string,
+  config?: unknown,
+): { localModelLean: boolean } {
+  const parsed = parseModelCatalogRef(model);
+  if (!parsed) {
+    return { localModelLean: false };
+  }
+  const providerConfig = configuredProvider(config, parsed.provider);
+  const ollamaCloud = parsed.provider === "ollama" && isCloudModelRef(model);
+  const configuredRemoteEndpoint =
+    typeof providerConfig?.baseUrl === "string" && !isLocalEndpoint(providerConfig.baseUrl);
+  const localRoute =
+    !ollamaCloud &&
+    (hasLocalProviderProvenance(providerConfig) ||
+      (LOCAL_MODEL_PROVIDER_IDS.has(parsed.provider) && !configuredRemoteEndpoint));
+  const localModelLean =
+    localRoute && (parsed.provider === "lmstudio" || parsed.provider === "ollama");
+  return { localModelLean };
 }
 
 async function hashDirectory(root: string): Promise<string> {
@@ -811,7 +1538,7 @@ function parseAgentExecOutput(stdout: string): {
     } else if (character === "}") {
       depth -= 1;
       if (depth === 0) {
-        const envelope = JSON.parse(value.slice(0, index + 1)) as AgentExecEnvelope;
+        const envelope = JSON.parse(value.slice(0, index + 1)) as MatrixAgentExecEnvelope;
         return { envelope, trailing: value.slice(index + 1).trim() };
       }
     }
@@ -908,19 +1635,78 @@ export function buildCodeModeMatrixAgentEnv(
   model: string,
   runtimeCwd: string,
   baseEnv: NodeJS.ProcessEnv = process.env,
+  config?: unknown,
+  credentialEnvNames: readonly string[] = [],
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {
-    ...baseEnv,
+    ...buildFrozenOperationalEnv(baseEnv),
     NODE_DISABLE_COMPILE_CACHE: "1",
     OPENCLAW_BUNDLED_PLUGINS_DIR: path.join(runtimeCwd, "dist", "extensions"),
+    OPENCLAW_LOAD_SHELL_ENV: "0",
   };
+  for (const name of credentialEnvNames) {
+    if (baseEnv[name] !== undefined) {
+      env[name] = baseEnv[name];
+    }
+  }
   // The local Ollama provider uses a non-secret opt-in marker. Keep cloud and
   // custom credentials caller-owned, but make the local acceptance path work.
-  if (model.startsWith("ollama/") && !env.OLLAMA_API_KEY) {
-    env.OLLAMA_API_KEY = "ollama-local";
+  if (
+    model.startsWith("ollama/") &&
+    classifyCodeModeMatrixModel(model, config).localModelLean &&
+    !env.OLLAMA_API_KEY
+  ) {
+    env.OLLAMA_API_KEY = baseEnv.OLLAMA_API_KEY ?? "ollama-local";
   }
   delete env.NODE_COMPILE_CACHE;
   return env;
+}
+
+function usesLocalModelLean(model: string, config?: unknown): boolean {
+  return classifyCodeModeMatrixModel(model, config).localModelLean;
+}
+
+export function buildCodeModeMatrixAgentExecArgs(params: {
+  configPath?: string;
+  frontierEvidencePolicy?: {
+    path: string;
+    sha256: string;
+  };
+  fixture: Pick<MatrixTaskFixture, "prompt">;
+  matrix: Pick<RunCellParams, "cell" | "config" | "thinking" | "timeoutSeconds">;
+  runtime: MatrixRuntimeEntrypoint;
+  stateDir: string;
+  workspace: string;
+}): string[] {
+  return [
+    ...params.runtime.args,
+    "agent",
+    "exec",
+    params.fixture.prompt,
+    "--cwd",
+    params.workspace,
+    "--state-dir",
+    params.stateDir,
+    "--code-mode",
+    params.matrix.cell.mode,
+    ...(usesLocalModelLean(params.matrix.cell.model, params.matrix.config)
+      ? ["--local-model-lean"]
+      : []),
+    ...(params.configPath ? ["--config", params.configPath] : []),
+    ...(params.frontierEvidencePolicy
+      ? [
+          "--frontier-evidence-policy",
+          params.frontierEvidencePolicy.path,
+          "--frontier-evidence-policy-sha256",
+          params.frontierEvidencePolicy.sha256,
+        ]
+      : []),
+    "--thinking",
+    params.matrix.thinking,
+    "--timeout",
+    String(params.matrix.timeoutSeconds),
+    "--json",
+  ];
 }
 
 async function executeAgentExec(params: {
@@ -930,35 +1716,29 @@ async function executeAgentExec(params: {
   workspace: string;
 }): Promise<{
   diagnostics: string;
-  envelope: AgentExecEnvelope;
+  envelope: MatrixAgentExecEnvelope;
   stdoutContractValid: boolean;
 }> {
   const runtime = params.matrix.runtime;
   if (!runtime) {
     throw new Error("matrix runtime entrypoint was not prepared");
   }
-  const args = [
-    ...runtime.args,
-    "agent",
-    "exec",
-    params.fixture.prompt,
-    "--cwd",
-    params.workspace,
-    "--state-dir",
-    params.stateDir,
-    "--model",
-    params.matrix.cell.model,
-    "--code-mode",
-    params.matrix.cell.mode,
-    "--local-model-lean",
-    "--thinking",
-    params.matrix.thinking,
-    "--timeout",
-    String(params.matrix.timeoutSeconds),
-    "--json",
-  ];
+  const args = buildCodeModeMatrixAgentExecArgs({
+    configPath: params.matrix.configPath,
+    frontierEvidencePolicy: params.matrix.frontierEvidencePolicy,
+    fixture: params.fixture,
+    matrix: params.matrix,
+    runtime,
+    stateDir: params.stateDir,
+    workspace: params.workspace,
+  });
   try {
-    const env = buildCodeModeMatrixAgentEnv(params.matrix.cell.model, runtime.cwd);
+    const env = {
+      ...params.matrix.frozenEnv,
+      NODE_DISABLE_COMPILE_CACHE: "1",
+      OPENCLAW_BUNDLED_PLUGINS_DIR: path.join(runtime.cwd, "dist", "extensions"),
+      OPENCLAW_LOAD_SHELL_ENV: "0",
+    };
     const { stdout, stderr } = await execFileAsync(process.execPath, args, {
       cwd: runtime.cwd,
       encoding: "utf8",
@@ -1024,7 +1804,7 @@ async function runMatrixCell(params: RunCellParams): Promise<CodeModeMatrixCellR
   const stateDir = path.join(root, "state");
   const workspace = path.join(root, "workspace");
   await fs.mkdir(stateDir, { recursive: true });
-  const fixture = await prepareTaskFixture(workspace, params.cell);
+  const fixture = await prepareCodeModeMatrixTaskFixture(workspace, params.cell);
   const startedAt = Date.now();
   try {
     const command = await executeAgentExec({
@@ -1054,6 +1834,7 @@ async function runMatrixCell(params: RunCellParams): Promise<CodeModeMatrixCellR
       ...(command.envelope.bridgeCalls ? { bridgeCalls: command.envelope.bridgeCalls } : {}),
       buildSha256: params.buildSha256,
       codeModeEngaged: command.envelope.codeModeEngaged ?? null,
+      configSha256: params.configSha256,
       ...(command.envelope.costUsd !== undefined ? { costUsd: command.envelope.costUsd } : {}),
       ...(diagnosticText ? { diagnostics: diagnosticText } : {}),
       elapsedMs: Date.now() - startedAt,
@@ -1061,6 +1842,7 @@ async function runMatrixCell(params: RunCellParams): Promise<CodeModeMatrixCellR
       expected: fixture.expected,
       failureCategory: classification.failureCategory,
       final: command.envelope.final,
+      fixtureSha256: fixture.fixtureSha256,
       gitSha: params.gitSha,
       id: params.cell.id,
       mode: params.cell.mode,
@@ -1069,6 +1851,7 @@ async function runMatrixCell(params: RunCellParams): Promise<CodeModeMatrixCellR
       observedProvider: command.envelope.provider,
       oracle: classification.oracle,
       passed: classification.passed,
+      promptSha256: fixture.promptSha256,
       repetition: params.cell.repetition,
       sourceDirty: params.sourceDirty,
       sourcePatchSha256: params.sourcePatchSha256,
@@ -1087,7 +1870,10 @@ async function runMatrixCell(params: RunCellParams): Promise<CodeModeMatrixCellR
 
 function harnessFailureResult(
   cell: MatrixCell,
-  provenance: Pick<RunCellParams, "buildSha256" | "gitSha" | "sourceDirty" | "sourcePatchSha256">,
+  provenance: Pick<
+    RunCellParams,
+    "buildSha256" | "configSha256" | "gitSha" | "sourceDirty" | "sourcePatchSha256"
+  >,
   elapsedMs: number,
   error: unknown,
 ): CodeModeMatrixCellResult {
@@ -1098,12 +1884,16 @@ function harnessFailureResult(
   return {
     buildSha256: provenance.buildSha256,
     codeModeEngaged: null,
+    configSha256: provenance.configSha256,
     diagnostics: message,
     elapsedMs,
     error: { kind: "harness_error", message },
     expected: verificationCode(cell),
     failureCategory: "harness_error",
     final: "",
+    fixtureSha256: createHash("sha256")
+      .update(`project=openclaw\nverification_code=${verificationCode(cell)}\n`)
+      .digest("hex"),
     gitSha: provenance.gitSha,
     id: cell.id,
     mode: cell.mode,
@@ -1118,6 +1908,53 @@ function harnessFailureResult(
       toolExecution: false,
     },
     passed: false,
+    promptSha256: createHash("sha256").update(taskPrompt(cell.task)).digest("hex"),
+    repetition: cell.repetition,
+    sourceDirty: provenance.sourceDirty,
+    sourcePatchSha256: provenance.sourcePatchSha256,
+    status: "error",
+    task: cell.task,
+    timestamp: new Date().toISOString(),
+  };
+}
+
+function proofDriftResult(
+  cell: MatrixCell,
+  provenance: Pick<
+    RunCellParams,
+    "buildSha256" | "configSha256" | "gitSha" | "sourceDirty" | "sourcePatchSha256"
+  >,
+  elapsedMs: number,
+  error: MatrixPreflightError,
+): CodeModeMatrixCellResult {
+  return {
+    buildSha256: provenance.buildSha256,
+    codeModeEngaged: null,
+    configSha256: provenance.configSha256,
+    diagnostics: error.code,
+    elapsedMs,
+    error: { kind: error.code, message: error.code },
+    expected: verificationCode(cell),
+    failureCategory: "proof_drift",
+    final: "",
+    fixtureSha256: createHash("sha256")
+      .update(`project=openclaw\nverification_code=${verificationCode(cell)}\n`)
+      .digest("hex"),
+    gitSha: provenance.gitSha,
+    id: cell.id,
+    mode: cell.mode,
+    model: cell.model,
+    observedModel: null,
+    observedProvider: null,
+    oracle: {
+      answer: false,
+      effect: false,
+      engagement: false,
+      identity: false,
+      toolExecution: false,
+    },
+    passed: false,
+    promptSha256: createHash("sha256").update(taskPrompt(cell.task)).digest("hex"),
     repetition: cell.repetition,
     sourceDirty: provenance.sourceDirty,
     sourcePatchSha256: provenance.sourcePatchSha256,
@@ -1188,6 +2025,42 @@ function summarizeResults(results: CodeModeMatrixCellResult[]) {
   });
 }
 
+function validateCellResultProvenance(params: {
+  cell: MatrixCell;
+  expectedBuildSha256: string;
+  expectedConfigSha256: string | null;
+  expectedSource: SourceIdentity;
+  result: CodeModeMatrixCellResult;
+}): string[] {
+  const reasons = new Set<string>();
+  if (params.result.buildSha256 !== params.expectedBuildSha256) {
+    reasons.add("build_mismatch");
+  }
+  if (params.result.configSha256 !== params.expectedConfigSha256) {
+    reasons.add("config_mismatch");
+  }
+  if (
+    params.result.gitSha !== params.expectedSource.gitSha ||
+    params.result.sourceDirty !== params.expectedSource.sourceDirty ||
+    params.result.sourcePatchSha256 !== params.expectedSource.sourcePatchSha256
+  ) {
+    reasons.add("source_mismatch");
+  }
+  const expectedFixtureSha256 = createHash("sha256")
+    .update(taskFixtureText(params.cell))
+    .digest("hex");
+  if (params.result.fixtureSha256 !== expectedFixtureSha256) {
+    reasons.add("fixture_mismatch");
+  }
+  const expectedPromptSha256 = createHash("sha256")
+    .update(taskPrompt(params.cell.task))
+    .digest("hex");
+  if (params.result.promptSha256 !== expectedPromptSha256) {
+    reasons.add("prompt_mismatch");
+  }
+  return [...reasons].toSorted();
+}
+
 async function writeJson(filePath: string, value: unknown): Promise<void> {
   await fs.mkdir(path.dirname(filePath), { recursive: true });
   await fs.writeFile(
@@ -1214,7 +2087,7 @@ function observedModelRef(result: CodeModeMatrixCellResult): string {
   return result.model;
 }
 
-function buildCodeModeMatrixEvidence(params: {
+export function buildCodeModeMatrixEvidence(params: {
   generatedAt: string;
   repoRoot: string;
   results: readonly CodeModeMatrixCellResult[];
@@ -1277,40 +2150,159 @@ function buildCodeModeMatrixEvidence(params: {
   });
 }
 
+function buildCodeModeMatrixPreflightEvidence(params: {
+  generatedAt: string;
+  gitSha: string;
+  model: string;
+  reasons: readonly string[];
+  repoRoot: string;
+}): QaEvidenceSummaryJson {
+  return buildScriptEvidenceSummary({
+    artifactPaths: [
+      { kind: "manifest", path: "manifest.json" },
+      { kind: "summary", path: "summary.json" },
+      { kind: "results", path: "results.jsonl" },
+    ],
+    evidenceMode: "full",
+    generatedAt: params.generatedAt,
+    packageSource: { kind: "source-checkout", sha: params.gitSha },
+    primaryModel: params.model,
+    providerMode: "live-frontier",
+    repoRoot: params.repoRoot,
+    runner: "code-mode-model-matrix",
+    targets: [
+      {
+        id: "matrix-preflight",
+        title: "Code Mode frontier matrix preflight",
+        sourcePath: SOURCE_PATH,
+      },
+    ],
+    results: [
+      {
+        id: "matrix-preflight",
+        status: "blocked",
+        durationMs: 1,
+        failureMessage: params.reasons.join(","),
+      },
+    ],
+  });
+}
+
 export async function runCodeModeModelMatrix(
   options: CodeModeMatrixOptions,
   deps: MatrixRunDependencies = {},
 ): Promise<{ exitCode: number; outputDir: string; summary: unknown }> {
   const now = deps.now?.() ?? new Date();
   const outputDir = resolveCodeModeMatrixOutputDir(options.repoRoot, options.outputDir, now);
-  const sourceIdentity = deps.readSourceIdentity
-    ? await deps.readSourceIdentity(options.repoRoot)
-    : deps.readGitSha
-      ? {
-          gitSha: await deps.readGitSha(options.repoRoot),
-          sourceDirty: false,
-          sourcePatchSha256: null,
-        }
-      : await readSourceIdentity(options.repoRoot);
-  const cells = buildCells(options);
+  const resolveSourceIdentity = async (): Promise<SourceIdentity> =>
+    deps.readSourceIdentity
+      ? await deps.readSourceIdentity(options.repoRoot)
+      : deps.readGitSha
+        ? {
+            gitSha: await deps.readGitSha(options.repoRoot),
+            sourceDirty: false,
+            sourcePatchSha256: null,
+          }
+        : await readSourceIdentity(options.repoRoot, outputDir);
+  const sourceIdentity = await resolveSourceIdentity();
+  const cells = buildCodeModeMatrixCells(options);
   await assertOutputOutsideGitMetadata(options.repoRoot, outputDir);
+  await assertOutputOutsideRuntimeArtifacts(options.repoRoot, outputDir);
+  await reserveCodeModeMatrixOutputDir(options.repoRoot, outputDir);
+  const resultsPath = path.join(outputDir, "results.jsonl");
+  await fs.writeFile(resultsPath, "", "utf8");
+  const authBindingId = randomBytes(16).toString("hex");
+
+  let configSnapshot: PinnedConfigSnapshot = {
+    effective: undefined,
+    parsed: undefined,
+    sha256: null,
+  };
+  let preflight: MatrixPreflight;
+  try {
+    configSnapshot = await readPinnedConfigSnapshot(options.config);
+    preflight = await evaluateMatrixPreflight({
+      config: configSnapshot.effective,
+      configSha256: configSnapshot.sha256,
+      model: options.models[0]!,
+      modes: options.modes,
+      repetitions: options.repetitions,
+      thinking: options.thinking,
+      authBindingId,
+      requireCredentialValue: true,
+      readAuthProfile: deps.readAuthProfile ?? readMatrixAuthProfile,
+    });
+  } catch (error) {
+    preflight = {
+      blockedReasons: [
+        error instanceof MatrixPreflightError ? error.code : "config_effective_load_failed",
+      ],
+    };
+  }
+  if (sourceIdentity.sourceDirty) {
+    preflight.blockedReasons = [...preflight.blockedReasons, "frontier_source_dirty"].toSorted();
+  }
+  const configSha256 = configSnapshot.sha256;
+  if (preflight.blockedReasons.length > 0 || !preflight.executionPolicy) {
+    const reasons =
+      preflight.blockedReasons.length > 0 ? preflight.blockedReasons : ["proof_policy_changed"];
+    const manifest = {
+      schemaVersion: MATRIX_SCHEMA_VERSION,
+      status: "blocked",
+      generatedAt: now.toISOString(),
+      source: SOURCE_PATH,
+      ...sourceIdentity,
+      buildSha256: null,
+      config: configSha256
+        ? { state: "pinned", sha256: configSha256 }
+        : { state: "unavailable", sha256: null },
+      model: options.models[0],
+      blockedReasons: reasons,
+      cells: [],
+    };
+    const summary = {
+      schemaVersion: MATRIX_SCHEMA_VERSION,
+      status: "blocked",
+      finishedAt: now.toISOString(),
+      ...sourceIdentity,
+      buildSha256: null,
+      cellsExecuted: 0,
+      blockedReasons: reasons,
+      counts: { total: 0, passed: 0, failed: 0 },
+    };
+    await writeJson(path.join(outputDir, "manifest.json"), manifest);
+    await writeJson(path.join(outputDir, "summary.json"), summary);
+    await writeJson(
+      path.join(outputDir, QA_EVIDENCE_FILENAME),
+      buildCodeModeMatrixPreflightEvidence({
+        generatedAt: now.toISOString(),
+        gitSha: sourceIdentity.gitSha,
+        model: options.models[0]!,
+        reasons,
+        repoRoot: options.repoRoot,
+      }),
+    );
+    return { exitCode: 1, outputDir, summary };
+  }
+
   if (!options.dryRun) {
     await (deps.buildCliArtifacts ?? buildMatrixCliArtifacts)(options.repoRoot);
   }
-  // Build first so its output set is complete, then reserve evidence storage
-  // before hashing. Dry runs also write evidence, so every run needs isolation.
-  await assertOutputOutsideRuntimeArtifacts(options.repoRoot, outputDir);
-  await reserveCodeModeMatrixOutputDir(options.repoRoot, outputDir);
   const buildSha256 = options.dryRun
     ? null
     : await (deps.readBuildSha256 ?? hashRuntimeArtifacts)(options.repoRoot);
   const manifest = {
     schemaVersion: MATRIX_SCHEMA_VERSION,
+    status: options.dryRun ? "dry-run" : "ready",
     generatedAt: now.toISOString(),
     source: SOURCE_PATH,
     ...sourceIdentity,
     buildSha256,
-    models: options.models,
+    config: configSha256
+      ? { state: "pinned", sha256: configSha256 }
+      : { state: "ambient", sha256: null },
+    executionPolicy: preflight.executionPolicy,
+    model: options.models[0],
     modes: options.modes,
     tasks: options.tasks,
     repetitions: options.repetitions,
@@ -1321,7 +2313,13 @@ export async function runCodeModeModelMatrix(
   };
   await writeJson(path.join(outputDir, "manifest.json"), manifest);
   if (options.dryRun) {
-    const summary = { status: "dry-run", total: cells.length };
+    const summary = {
+      schemaVersion: MATRIX_SCHEMA_VERSION,
+      status: "dry-run",
+      cellsExecuted: 0,
+      totalPlanned: cells.length,
+      executionPolicy: preflight.executionPolicy,
+    };
     await writeJson(path.join(outputDir, "summary.json"), summary);
     await writeJson(
       path.join(outputDir, QA_EVIDENCE_FILENAME),
@@ -1334,6 +2332,13 @@ export async function runCodeModeModelMatrix(
     return { exitCode: 0, outputDir, summary };
   }
 
+  const frozenEnv = buildFrozenOperationalEnv(process.env);
+  frozenEnv[preflight.executionPolicy.credentialEnvName] = preflight.credentialValue;
+  delete frozenEnv.NODE_COMPILE_CACHE;
+  const policyFile = await createFrontierEvidencePolicyFile({
+    configSha256: configSha256!,
+    executionPolicy: preflight.executionPolicy,
+  });
   const runtimeRoot = deps.runCell
     ? undefined
     : await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-code-mode-runtime-"));
@@ -1341,17 +2346,64 @@ export async function runCodeModeModelMatrix(
     const runtime = runtimeRoot
       ? await prepareRuntimeEntrypoint(options.repoRoot, runtimeRoot)
       : undefined;
+    if (runtime && buildSha256) {
+      const runtimeBuildSha256 = await hashRuntimeArtifacts(options.repoRoot);
+      if (runtimeBuildSha256 !== buildSha256) {
+        throw new Error(
+          `prepared runtime build mismatch: expected ${buildSha256}, observed ${runtimeBuildSha256}`,
+        );
+      }
+    }
     const results: CodeModeMatrixCellResult[] = [];
-    const resultsPath = path.join(outputDir, "results.jsonl");
-    await fs.writeFile(resultsPath, "", "utf8");
     const executeCell = deps.runCell ?? runMatrixCell;
     for (const cell of cells) {
       let result: CodeModeMatrixCellResult;
+      let proofDrift = false;
       const cellStartedAt = Date.now();
       try {
+        const observedSourceIdentity = await resolveSourceIdentity();
+        if (
+          observedSourceIdentity.gitSha !== sourceIdentity.gitSha ||
+          observedSourceIdentity.sourceDirty !== sourceIdentity.sourceDirty ||
+          observedSourceIdentity.sourcePatchSha256 !== sourceIdentity.sourcePatchSha256
+        ) {
+          throw new MatrixPreflightError("frontier_source_changed");
+        }
+        const observedConfig = await readPinnedConfigSnapshot(options.config);
+        if (observedConfig.sha256 !== configSha256) {
+          throw new MatrixPreflightError("proof_policy_changed");
+        }
+        const observedPreflight = await evaluateMatrixPreflight({
+          config: observedConfig.effective,
+          configSha256: observedConfig.sha256,
+          model: options.models[0]!,
+          modes: options.modes,
+          repetitions: options.repetitions,
+          thinking: options.thinking,
+          authBindingId,
+          requireCredentialValue: false,
+          readAuthProfile: deps.readAuthProfile ?? readMatrixAuthProfile,
+        });
+        if (observedPreflight.blockedReasons.length > 0) {
+          throw new MatrixPreflightError(observedPreflight.blockedReasons[0]!);
+        }
+        if (
+          JSON.stringify(observedPreflight.executionPolicy) !==
+          JSON.stringify(preflight.executionPolicy)
+        ) {
+          throw new MatrixPreflightError("proof_policy_changed");
+        }
         result = await executeCell({
           buildSha256: buildSha256 ?? "dry-run",
           cell,
+          config: configSnapshot.effective,
+          configPath: options.config,
+          configSha256,
+          frozenEnv,
+          frontierEvidencePolicy: {
+            path: policyFile.path,
+            sha256: policyFile.sha256,
+          },
           gitSha: sourceIdentity.gitSha,
           keepState: options.keepState,
           outputDir,
@@ -1363,14 +2415,64 @@ export async function runCodeModeModelMatrix(
           timeoutSeconds: options.timeoutSeconds,
         });
       } catch (error) {
-        result = harnessFailureResult(
+        const provenance = {
+          buildSha256: buildSha256 ?? "dry-run",
+          configSha256,
+          ...sourceIdentity,
+        };
+        if (error instanceof MatrixPreflightError) {
+          proofDrift = true;
+          result = proofDriftResult(cell, provenance, Date.now() - cellStartedAt, error);
+        } else {
+          result = harnessFailureResult(cell, provenance, Date.now() - cellStartedAt, error);
+        }
+      }
+      const provenanceReasons = validateCellResultProvenance({
+        cell,
+        expectedBuildSha256: buildSha256 ?? "dry-run",
+        expectedConfigSha256: configSha256,
+        expectedSource: sourceIdentity,
+        result,
+      });
+      if (provenanceReasons.length > 0) {
+        proofDrift = true;
+        result = proofDriftResult(
           cell,
           {
             buildSha256: buildSha256 ?? "dry-run",
+            configSha256,
             ...sourceIdentity,
           },
           Date.now() - cellStartedAt,
-          error,
+          new MatrixPreflightError(provenanceReasons[0]!),
+        );
+      }
+      const postRunReasons: string[] = [];
+      const postRunSourceIdentity = await resolveSourceIdentity();
+      if (
+        postRunSourceIdentity.gitSha !== sourceIdentity.gitSha ||
+        postRunSourceIdentity.sourceDirty !== sourceIdentity.sourceDirty ||
+        postRunSourceIdentity.sourcePatchSha256 !== sourceIdentity.sourcePatchSha256
+      ) {
+        postRunReasons.push("source_mismatch");
+      }
+      if ((await readPinnedConfigSnapshot(options.config)).sha256 !== configSha256) {
+        postRunReasons.push("config_mismatch");
+      }
+      if (!deps.runCell && (await hashRuntimeArtifacts(options.repoRoot)) !== buildSha256) {
+        postRunReasons.push("build_mismatch");
+      }
+      if (postRunReasons.length > 0) {
+        proofDrift = true;
+        result = proofDriftResult(
+          cell,
+          {
+            buildSha256: buildSha256 ?? "dry-run",
+            configSha256,
+            ...sourceIdentity,
+          },
+          Date.now() - cellStartedAt,
+          new MatrixPreflightError(postRunReasons[0]!),
         );
       }
       results.push(result);
@@ -1381,6 +2483,10 @@ export async function runCodeModeModelMatrix(
       );
       const label = result.passed ? "PASS" : `FAIL ${result.failureCategory ?? "unknown"}`;
       console.log(`[code-mode-matrix] ${label} ${result.id} ${result.elapsedMs}ms`);
+      if (proofDrift) {
+        console.log("[code-mode-matrix] stopping after proof policy drift");
+        break;
+      }
     }
 
     const groups = summarizeResults(results);
@@ -1419,6 +2525,7 @@ export async function runCodeModeModelMatrix(
       summary,
     };
   } finally {
+    await policyFile.cleanup();
     if (runtimeRoot) {
       await fs.rm(runtimeRoot, { force: true, recursive: true });
     }
