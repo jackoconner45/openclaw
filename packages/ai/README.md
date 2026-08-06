@@ -22,7 +22,12 @@ application concerns. OpenClaw supplies those policies around this package.
 Host policy (request fetch guarding, secret redaction, strict-tool defaults,
 provider plugin hooks, diagnostics logging, and typed transport-event
 observation) can be injected with `configureAiTransportHost`; the defaults are
-inert. A transport attempt is one dispatched provider request. Connection setup
+inert. `beforeFetchDispatch` is a blocking callback invoked for every physical
+fetch hop after SSRF and DNS preflight but before network dispatch; throwing
+prevents that hop, and a host that cannot install the guard fails closed.
+`onFetchDispatch` remains isolated observational accounting and cannot change
+provider behavior. A transport attempt is one dispatched provider request,
+which is distinct from physical fetch hops such as redirects. Connection setup
 and prewarm are separate facts. Transport fallback stages a concrete target
 until a matching attempt or zero-submission phase consumes it. Server-side
 provider fallback records an in-stream serving-model transition without

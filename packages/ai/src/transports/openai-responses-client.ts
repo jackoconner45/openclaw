@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { AssistantMessage, Context, Model, StreamFn } from "@openclaw/llm-core";
 import OpenAI, { AzureOpenAI } from "openai";
 import { getEnvApiKey } from "../env-api-keys.js";
-import { getAiTransportHost } from "../host.js";
+import { getAiTransportHost, type AiBeforeFetchDispatch } from "../host.js";
 import { resolveAzureDeploymentNameFromMap } from "../providers/azure-deployment-map.js";
 import { isOpenAICompatibleAzureResponsesBaseUrl } from "../providers/azure-openai-responses-client-compat.js";
 import { createAssistantMessageEventStream } from "../utils/event-stream.js";
@@ -17,6 +17,7 @@ import { emitModelTransportDebug } from "./model-transport-debug.js";
 import { formatModelTransportDebugBaseUrl } from "./model-transport-url.js";
 import {
   AZURE_RESPONSES_FIRST_EVENT_TIMEOUT_MS,
+  openAIResponsesDispatchGuards,
   type OpenAIResponsesOptions,
 } from "./openai-responses-contracts.js";
 import {
@@ -104,6 +105,7 @@ export function createOpenAIResponsesClient(
   requestId?: string,
   callerSignal?: AbortSignal,
   accountingOverride?: ReturnType<typeof createOpenAISdkAccountingFetch>,
+  beforeFetchDispatch?: AiBeforeFetchDispatch,
 ) {
   const accounting =
     accountingOverride ??
@@ -114,6 +116,7 @@ export function createOpenAIResponsesClient(
       callerSignal,
     });
   const guardedFetch = buildGuardedModelFetch(model, undefined, {
+    ...(beforeFetchDispatch ? { beforeFetchDispatch } : {}),
     onFetchDispatch: accounting.onFetchDispatch,
   });
   const client = new OpenAI({
@@ -139,6 +142,7 @@ type ResponsesStreamParams = Parameters<
 };
 
 type ResponsesTransportExecutorOptions = {
+  allowDispatchGuards?: true;
   outputApi?: AssistantMessage["api"];
   firstEventTimeoutMs?: number;
   streamRequest?: boolean;
@@ -158,6 +162,12 @@ type ResponsesTransportExecutorOptions = {
 function createResponsesTransportExecutor(config: ResponsesTransportExecutorOptions): StreamFn {
   return (model, context, options) => {
     const responsesOptions = options as OpenAIResponsesOptions | undefined;
+    const dispatchGuards =
+      config.allowDispatchGuards === true &&
+      model.provider === "openai" &&
+      model.api === "openai-responses"
+        ? openAIResponsesDispatchGuards.get(options)
+        : undefined;
     const accounting = createOpenAISdkAccountingFetch({
       model,
       ...(options?.requestId ? { callId: options.requestId } : {}),
@@ -195,17 +205,30 @@ function createResponsesTransportExecutor(config: ResponsesTransportExecutorOpti
           attempt: 1,
           transport: "stream",
         });
-        client = config.createClient(
-          model,
-          context,
-          apiKey,
-          options?.headers,
-          turnState?.headers,
-          options?.sessionId,
-          options?.requestId,
-          options?.signal,
-          accounting,
-        );
+        client = dispatchGuards
+          ? config.createClient(
+              model,
+              context,
+              apiKey,
+              options?.headers,
+              turnState?.headers,
+              options?.sessionId,
+              options?.requestId,
+              options?.signal,
+              accounting,
+              dispatchGuards.beforeFetchDispatch,
+            )
+          : config.createClient(
+              model,
+              context,
+              apiKey,
+              options?.headers,
+              turnState?.headers,
+              options?.sessionId,
+              options?.requestId,
+              options?.signal,
+              accounting,
+            );
         let params = config.buildRequest(model, context, responsesOptions, turnState?.metadata);
         const nextParams = await options?.onPayload?.(params, model);
         if (nextParams !== undefined) {
@@ -250,6 +273,17 @@ function createResponsesTransportExecutor(config: ResponsesTransportExecutorOpti
           requestOptions,
           model,
           observePrompt,
+          ...(dispatchGuards
+            ? {
+                beforeTransportDispatch: (request, payloadVariant) =>
+                  dispatchGuards.beforeTransportDispatch({
+                    model,
+                    request,
+                    payloadVariant,
+                    maxRetries: options?.maxRetries,
+                  }),
+              }
+            : {}),
         });
         await options?.onResponse?.(
           { status: response.status, headers: headersToRecord(response.headers) },
@@ -313,6 +347,7 @@ function createResponsesTransportExecutor(config: ResponsesTransportExecutorOpti
 
 export function createOpenAIResponsesTransportStreamFn(): StreamFn {
   return createResponsesTransportExecutor({
+    allowDispatchGuards: true,
     streamRequest: true,
     createClient: createOpenAIResponsesClient,
     buildRequest: buildOpenAIResponsesParams,
@@ -334,8 +369,15 @@ export function createAzureOpenAIResponsesTransportStreamFn(): StreamFn {
         resolveAzureDeploymentName(model),
         metadata,
       ),
-    createResponseStream: async ({ client, request, requestOptions, observePrompt }) => {
+    createResponseStream: async ({
+      client,
+      request,
+      requestOptions,
+      observePrompt,
+      beforeTransportDispatch,
+    }) => {
       observePrompt?.(request, { egress: "responses-sdk", payloadVariant: "initial" });
+      beforeTransportDispatch?.(request, "initial");
       const { data, response } = await client.responses
         .create(request as never, requestOptions)
         .withResponse();

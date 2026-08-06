@@ -6,7 +6,12 @@ import path from "node:path";
 import { TextDecoder } from "node:util";
 import { readByteStreamWithLimit } from "@openclaw/media-core/read-byte-stream-with-limit";
 import { findAgentRunTerminalOutcome } from "../agents/agent-run-terminal-error.js";
-import { runWithFrontierEvidencePolicy } from "../agents/frontier-evidence-policy.js";
+import {
+  computeFrontierEvidenceDigest,
+  readFrontierEvidenceBindings,
+  runWithFrontierEvidencePolicy,
+} from "../agents/frontier-evidence-policy.js";
+import type { FrontierEvidenceSnapshot } from "../agents/frontier-evidence-transport-policy.js";
 import { isExecutionIdentityCollectionEnabled } from "../audit/audit-config.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { mergeDeep } from "../infra/deep-merge.js";
@@ -510,6 +515,7 @@ export async function agentExecCommand(
         : import("./agent.js").then((module) => module.agentCommand),
     ]);
     let fallbackExhausted = false;
+    let frontierEvidenceReceipt: FrontierEvidenceSnapshot[] | undefined;
     let resultErrorPayload: string | true | undefined;
     const silentRuntime: RuntimeEnv = {
       log: () => {},
@@ -552,14 +558,23 @@ export async function agentExecCommand(
         : opts.authEnvOnly === true
           ? withEnvOnlyAuthProfileStore(runWithPluginInstallRoots)
           : withAuthProfileStoreAgentDir(storedAuthAgentDir, runWithPluginInstallRoots);
-    const runWithEvidencePolicy = () =>
-      frontierEvidence
-        ? runWithFrontierEvidencePolicy(
-            frontierEvidence.policy,
-            frontierEvidence.authProfileId,
-            runWithAuthScope,
-          )
-        : runWithAuthScope();
+    const runWithEvidencePolicy = () => {
+      if (!frontierEvidence) {
+        return runWithAuthScope();
+      }
+      return runWithFrontierEvidencePolicy(
+        frontierEvidence.policy,
+        frontierEvidence.authProfileId,
+        async () => {
+          const result = await runWithAuthScope();
+          frontierEvidenceReceipt = readFrontierEvidenceBindings().map((binding) =>
+            binding.collector.snapshot(),
+          );
+          return result;
+        },
+        computeFrontierEvidenceDigest(frontierEvidence.policy.contentDigestKey, "task", prompt),
+      );
+    };
     const result = await withHostExecInheritedEnvOmitted(
       [
         ...listKnownProviderAuthEnvVarNames({ env: process.env }),
@@ -571,6 +586,9 @@ export async function agentExecCommand(
       throw new Error("Agent run returned no result");
     }
     const envelope = classifyAgentExecResult(result, fallbackExhausted, resultErrorPayload);
+    if (frontierEvidenceReceipt) {
+      envelope.frontierEvidence = frontierEvidenceReceipt;
+    }
     if (!envelope.sessionId) {
       envelope.sessionId = sessionId;
     }

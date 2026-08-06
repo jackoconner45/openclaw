@@ -32,7 +32,7 @@ const frozenConfig = `{
   },
 }\n`;
 
-const matrixAuthProfile = async () => ({
+const matrixAuthProfile = async (_params: { profileId: string }) => ({
   credentialEnvName: "OPENAI_API_KEY",
   credentialValue: "sk-matrix-test",
   mode: "api_key",

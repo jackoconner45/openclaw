@@ -17,6 +17,8 @@ export interface AiProviderRequestCapabilities {
   allowsAnthropicServiceTier: boolean;
 }
 
+export type AiBeforeFetchDispatch = (params: { url: string; init: RequestInit }) => void;
+
 /** Transport-safe provider policy input kept independent of OpenClaw config types. */
 export interface AiProviderRequestPolicyInput {
   provider?: string;
@@ -237,6 +239,8 @@ export interface AiTransportHost {
     timeoutMs?: number,
     options?: {
       sanitizeSse?: boolean;
+      /** Blocks a physical fetch hop after preflight and before dispatch. */
+      beforeFetchDispatch?: AiBeforeFetchDispatch;
       /**
        * Fires once immediately before the first fetch invocation, after request
        * preflight. Redirect hops remain one transport attempt.

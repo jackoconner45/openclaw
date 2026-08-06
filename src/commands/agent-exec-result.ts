@@ -1,4 +1,5 @@
 import type { EmbeddedAgentRunMeta } from "../agents/embedded-agent.js";
+import type { FrontierEvidenceSnapshot } from "../agents/frontier-evidence-transport-policy.js";
 
 export type AgentExecPayload = {
   text?: string;
@@ -30,6 +31,7 @@ export type AgentExecEnvelope = {
   bridgeCalls?: NonNullable<NonNullable<EmbeddedAgentRunMeta["agentMeta"]>["bridgeCalls"]>;
   codeModeStats?: NonNullable<NonNullable<EmbeddedAgentRunMeta["agentMeta"]>["codeModeStats"]>;
   toolSummary?: NonNullable<EmbeddedAgentRunMeta["toolSummary"]>;
+  frontierEvidence?: FrontierEvidenceSnapshot[];
   model: string | null;
   provider: string | null;
   sessionId: string;

@@ -48,7 +48,13 @@ A runnable version lives in the repository at `examples/ai-chat`.
   example SSRF policy), secret redaction of tool-result replay text, OpenAI
   strict-tool defaults, diagnostics logging, and typed transport-event
   observation are `AiTransportHost` ports configured with
-  `configureAiTransportHost`. One attempt means one dispatched provider request;
+  `configureAiTransportHost`. `beforeFetchDispatch` is a blocking callback for
+  every physical fetch hop after SSRF and DNS preflight but before network
+  dispatch. Throwing prevents that hop, and hosts that cannot install a
+  requested blocking guard fail closed. `onFetchDispatch` remains isolated
+  observational accounting and cannot alter provider behavior. One attempt
+  means one dispatched provider request, distinct from physical fetch hops such
+  as redirects;
   connection setup and prewarm do not count as attempts. A zero-submission fact
   means the route phase ended before the dispatch boundary. Transport fallback
   stages a concrete target until a matching attempt or zero-submission phase

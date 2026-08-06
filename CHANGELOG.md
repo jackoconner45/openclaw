@@ -6,6 +6,7 @@ Docs: https://docs.openclaw.ai
 
 ### Changes
 
+- **AI transport dispatch guards:** expose a fail-closed blocking callback for each physical fetch hop after network preflight and before dispatch, while keeping provider-attempt accounting isolated and once per SDK request.
 - **Provider transport accounting:** count OpenAI transport attempts at the dispatch boundary, including synchronous fetch and WebSocket send failures, while preserving zero-submission facts for preflight failures.
 - **Plugin uninstall cleanup:** remove exact recorded install paths from `plugins.load.paths` for marketplace, npm, and other managed installs while preserving parent, child, prefix, and unrelated paths.
 - Fixed Crabbox hydration on unprivileged cloud sandboxes by falling back to a user-writable pnpm store when the shared `/var/cache/crabbox` cache is unavailable, preserving the hardlink import mode after hydration, and making Docker an explicit routed capability instead of an implicit install requirement.

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { execFile } from "node:child_process";
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, createHmac, randomBytes } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -113,6 +113,7 @@ export type CodeModeMatrixCellResult = {
   expected: string;
   failureCategory: CellFailureCategory | null;
   final: string;
+  frontierEvidence?: AgentExecEnvelope["frontierEvidence"];
   fixtureSha256: string;
   gitSha: string;
   id: string;
@@ -255,7 +256,7 @@ Options:
   --task <task>             read | dependent-read-write; repeat to select tasks
   --repetitions <n>         Runs per model/mode/task cell (default: ${DEFAULT_REPETITIONS}, max: ${MAX_REPETITIONS})
   --timeout <seconds>       Per-run agent deadline (default: ${DEFAULT_TIMEOUT_SECONDS})
-  --thinking <level>        Agent thinking level (default: off)
+  --thinking <level>        Agent thinking level (default: off; frontier evidence requires high)
   --output-dir <path>       Repo-relative artifact directory
   --keep-state              Retain per-cell state and workspace directories
   --allow-failures          Exit zero after writing evidence even when cells fail
@@ -952,6 +953,7 @@ function buildFrozenOperationalEnv(baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEn
 }
 
 async function createFrontierEvidencePolicyFile(params: {
+  contentDigestKey: string;
   configSha256: string;
   executionPolicy: MatrixExecutionPolicy;
 }): Promise<{
@@ -975,6 +977,7 @@ async function createFrontierEvidencePolicyFile(params: {
     baseUrl: "https://api.openai.com/v1",
     runtime: "openclaw",
     authBindingId: params.executionPolicy.authBindingId,
+    contentDigestKey: params.contentDigestKey,
     credentialState: "frozen_in_memory",
     credentialEnvName: params.executionPolicy.credentialEnvName,
     fallbacks: "disabled",
@@ -990,7 +993,23 @@ async function createFrontierEvidencePolicyFile(params: {
     thinking: params.executionPolicy.thinking,
     seed: "absent",
     authoredRequestParams: "absent",
-    allowedRequestControls: [],
+    maxLogicalCalls: 64,
+    expectedReasoning: { effort: "high", summary: "auto" },
+    expectedInclude: ["reasoning.encrypted_content"],
+    expectedMetadata: {
+      source: "openai_transport_turn_state",
+      keys: [
+        "openclaw_session_id",
+        "openclaw_transport",
+        "openclaw_turn_attempt",
+        "openclaw_turn_id",
+      ],
+      valueClass: "volatile_execution_metadata",
+    },
+    expectedToolChoice: "absent",
+    expectedPromptCacheKey: "session_boundary",
+    expectedPromptCacheRetention: "absent",
+    expectedMaxRetries: 2,
   };
   const raw = `${JSON.stringify(policy)}\n`;
   await fs.writeFile(policyPath, raw, { encoding: "utf8", flag: "wx", mode: 0o600 });
@@ -1842,6 +1861,9 @@ async function runMatrixCell(params: RunCellParams): Promise<CodeModeMatrixCellR
       expected: fixture.expected,
       failureCategory: classification.failureCategory,
       final: command.envelope.final,
+      ...(command.envelope.frontierEvidence
+        ? { frontierEvidence: command.envelope.frontierEvidence }
+        : {}),
       fixtureSha256: fixture.fixtureSha256,
       gitSha: params.gitSha,
       id: params.cell.id,
@@ -2023,6 +2045,71 @@ function summarizeResults(results: CodeModeMatrixCellResult[]) {
       total: group.total,
     };
   });
+}
+
+function auditFrontierEvidenceReceipts(
+  results: readonly CodeModeMatrixCellResult[],
+  contentDigestKey: string,
+): { valid: boolean; reasons: string[] } {
+  const reasons = new Set<string>();
+  const taskByPair = new Map<string, string>();
+  const comparableInputByMode = new Map<string, string>();
+  const schemaByMode = new Map<string, string>();
+  for (const result of results) {
+    const receipts = result.frontierEvidence;
+    if (receipts?.length !== 1 || !receipts[0]?.valid) {
+      reasons.add("frontier_receipt_missing_or_invalid");
+      continue;
+    }
+    const receipt = receipts[0];
+    const requests = receipt.callSequences.flatMap((call) => call.requests);
+    if (requests.length === 0) {
+      reasons.add("frontier_request_digest_missing");
+      continue;
+    }
+    const expectedTaskDigest = createHmac("sha256", Buffer.from(contentDigestKey, "hex"))
+      .update("openclaw-frontier-task-v1\0")
+      .update(taskPrompt(result.task), "utf8")
+      .digest("hex");
+    if (requests.some((request) => request.taskDigest !== expectedTaskDigest)) {
+      reasons.add("frontier_task_digest_mismatch");
+    }
+    const pairKey = `${result.model}\0${result.task}\0${String(result.repetition)}`;
+    const priorTask = taskByPair.get(pairKey);
+    if (priorTask && priorTask !== requests[0]!.taskDigest) {
+      reasons.add("frontier_cross_mode_task_instability");
+    }
+    taskByPair.set(pairKey, requests[0]!.taskDigest);
+    const modeKey = `${result.model}\0${result.mode}\0${result.task}`;
+    if (
+      requests.some(
+        (request) =>
+          !/^[a-f0-9]{64}$/u.test(request.fullInputDigest) ||
+          !/^[a-f0-9]{64}$/u.test(request.comparableInputDigest),
+      )
+    ) {
+      reasons.add("frontier_request_digest_missing");
+      continue;
+    }
+    const comparableInput = requests[0]!.comparableInputDigest;
+    const priorComparableInput = comparableInputByMode.get(modeKey);
+    if (priorComparableInput && priorComparableInput !== comparableInput) {
+      reasons.add("frontier_within_mode_comparable_input_instability");
+    }
+    comparableInputByMode.set(modeKey, comparableInput);
+    const schemaDigests = new Set(requests.map((request) => request.toolSchemaDigest));
+    if (schemaDigests.size !== 1) {
+      reasons.add("frontier_cell_tool_schema_instability");
+      continue;
+    }
+    const schema = requests[0]!.toolSchemaDigest;
+    const priorSchema = schemaByMode.get(modeKey);
+    if (priorSchema && priorSchema !== schema) {
+      reasons.add("frontier_within_mode_tool_schema_instability");
+    }
+    schemaByMode.set(modeKey, schema);
+  }
+  return { valid: reasons.size === 0, reasons: [...reasons].toSorted() };
 }
 
 function validateCellResultProvenance(params: {
@@ -2335,7 +2422,9 @@ export async function runCodeModeModelMatrix(
   const frozenEnv = buildFrozenOperationalEnv(process.env);
   frozenEnv[preflight.executionPolicy.credentialEnvName] = preflight.credentialValue;
   delete frozenEnv.NODE_COMPILE_CACHE;
+  const contentDigestKey = randomBytes(32).toString("hex");
   const policyFile = await createFrontierEvidencePolicyFile({
+    contentDigestKey,
     configSha256: configSha256!,
     executionPolicy: preflight.executionPolicy,
   });
@@ -2493,6 +2582,7 @@ export async function runCodeModeModelMatrix(
     const failed = results.filter((result) => !result.passed).length;
     const firstPassPassed = groups.filter((group) => group.firstPassPassed).length;
     const eventualPassed = groups.filter((group) => group.eventualPassed).length;
+    const frontierEvidenceAudit = auditFrontierEvidenceReceipts(results, contentDigestKey);
     const summary = {
       schemaVersion: MATRIX_SCHEMA_VERSION,
       finishedAt: new Date().toISOString(),
@@ -2509,6 +2599,7 @@ export async function runCodeModeModelMatrix(
         eventualPassed,
       },
       groups,
+      frontierEvidenceAudit,
     };
     await writeJson(path.join(outputDir, "summary.json"), summary);
     await writeJson(
@@ -2520,7 +2611,7 @@ export async function runCodeModeModelMatrix(
       }),
     );
     return {
-      exitCode: failed > 0 && !options.allowFailures ? 1 : 0,
+      exitCode: (failed > 0 && !options.allowFailures) || !frontierEvidenceAudit.valid ? 1 : 0,
       outputDir,
       summary,
     };

@@ -1008,6 +1008,63 @@ describe("fetchWithSsrFGuard hardening", () => {
     }
   });
 
+  it("runs the blocking pre-fetch hook after preflight for every redirect hop", async () => {
+    const beforeFetchDispatch = vi.fn();
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(redirectResponse("https://cdn.example.com/asset"))
+      .mockResolvedValueOnce(okResponse("redirected"));
+
+    const result = await fetchWithSsrFGuard({
+      url: "https://api.example.com/start",
+      fetchImpl,
+      lookupFn: createPublicLookup(),
+      beforeFetchDispatch,
+    });
+
+    expect(beforeFetchDispatch).toHaveBeenCalledTimes(2);
+    expect(beforeFetchDispatch.mock.calls.map(([call]) => call.url)).toEqual([
+      "https://api.example.com/start",
+      "https://cdn.example.com/asset",
+    ]);
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    await result.release();
+  });
+
+  it("does not run the blocking pre-fetch hook when redirect preflight fails", async () => {
+    const beforeFetchDispatch = vi.fn();
+    const fetchImpl = vi.fn().mockResolvedValueOnce(redirectResponse("http://127.0.0.1:6379/"));
+
+    await expect(
+      fetchWithSsrFGuard({
+        url: "https://public.example/start",
+        fetchImpl,
+        lookupFn: createPublicLookup(),
+        beforeFetchDispatch,
+      }),
+    ).rejects.toThrow(/private|internal|blocked/i);
+
+    expect(beforeFetchDispatch).toHaveBeenCalledOnce();
+    expect(fetchImpl).toHaveBeenCalledOnce();
+  });
+
+  it("lets the blocking pre-fetch hook reject before network egress", async () => {
+    const fetchImpl = vi.fn(async () => okResponse());
+
+    await expect(
+      fetchWithSsrFGuard({
+        url: "https://api.example.com/data",
+        fetchImpl,
+        lookupFn: createPublicLookup(),
+        beforeFetchDispatch: () => {
+          throw new Error("policy rejected");
+        },
+      }),
+    ).rejects.toThrow("policy rejected");
+
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
   it("does not let a throwing dispatch observer block the network fetch", async () => {
     const fetchImpl = vi.fn(async () => okResponse());
     const onFetchDispatch = vi.fn(() => {

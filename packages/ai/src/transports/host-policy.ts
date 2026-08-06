@@ -1,11 +1,23 @@
 import type { Api, Context, Model } from "@openclaw/llm-core";
-import { getAiTransportHost, type AiProviderRequestPolicyInput } from "../host.js";
+import {
+  getAiTransportHost,
+  type AiBeforeFetchDispatch,
+  type AiProviderRequestPolicyInput,
+} from "../host.js";
+
+export class AiTransportDispatchGuardUnavailableError extends Error {
+  constructor() {
+    super("blocking model fetch dispatch guard is unavailable");
+    this.name = "AiTransportDispatchGuardUnavailableError";
+  }
+}
 
 export function buildGuardedModelFetch(
   model: Model,
   timeoutMs?: number,
   options?: {
     sanitizeSse?: boolean;
+    beforeFetchDispatch?: AiBeforeFetchDispatch;
     onFetchDispatch?: () => void;
   },
 ): typeof fetch {
@@ -15,7 +27,10 @@ export function buildGuardedModelFetch(
     if (guardedFetch) {
       return guardedFetch;
     }
-    if (options.onFetchDispatch) {
+    if (options.beforeFetchDispatch || options.onFetchDispatch) {
+      if (options.beforeFetchDispatch) {
+        throw new AiTransportDispatchGuardUnavailableError();
+      }
       return async (input, init) => {
         const dispatched = globalThis.fetch(input, init);
         try {

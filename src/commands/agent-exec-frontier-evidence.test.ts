@@ -79,6 +79,7 @@ async function writeFrontierEvidenceFixture(params: {
     baseUrl: "https://api.openai.com/v1",
     runtime: "openclaw",
     authBindingId: "c".repeat(32),
+    contentDigestKey: "d".repeat(64),
     credentialState: "frozen_in_memory",
     credentialEnvName: params.credentialEnvName,
     fallbacks: "disabled",
@@ -94,7 +95,23 @@ async function writeFrontierEvidenceFixture(params: {
     thinking: "high",
     seed: "absent",
     authoredRequestParams: "absent",
-    allowedRequestControls: [],
+    maxLogicalCalls: 64,
+    expectedReasoning: { effort: "high", summary: "auto" },
+    expectedInclude: ["reasoning.encrypted_content"],
+    expectedMetadata: {
+      source: "openai_transport_turn_state",
+      keys: [
+        "openclaw_session_id",
+        "openclaw_transport",
+        "openclaw_turn_attempt",
+        "openclaw_turn_id",
+      ],
+      valueClass: "volatile_execution_metadata",
+    },
+    expectedToolChoice: "absent",
+    expectedPromptCacheKey: "session_boundary",
+    expectedPromptCacheRetention: "absent",
+    expectedMaxRetries: 2,
   };
   const rawPolicy = `${JSON.stringify(policy)}\n`;
   const policyPath = path.join(root, "policy.json");

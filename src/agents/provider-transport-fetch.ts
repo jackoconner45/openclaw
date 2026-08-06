@@ -3,6 +3,7 @@
  *
  * Applies request timeouts, proxy/TLS overrides, SSRF policy, local-service leases, retry hints, and SSE normalization.
  */
+import type { AiBeforeFetchDispatch } from "@openclaw/ai";
 import { parseRetryAfterHttpDateMs } from "@openclaw/ai/internal/retry-after";
 import { emitModelTransportDebug } from "@openclaw/ai/transports";
 import { formatModelTransportDebugUrl } from "@openclaw/ai/transports";
@@ -786,6 +787,7 @@ export function buildGuardedModelFetch(
   timeoutMs?: number,
   options?: {
     sanitizeSse?: boolean;
+    beforeFetchDispatch?: AiBeforeFetchDispatch;
     onFetchDispatch?: () => void;
   },
 ): typeof fetch {
@@ -871,6 +873,11 @@ export function buildGuardedModelFetch(
       // replays unsafe request bodies across cross-origin redirects.
       allowCrossOriginUnsafeRedirectReplay: false,
       ...(policy ? { policy } : {}),
+      ...(options?.beforeFetchDispatch
+        ? {
+            beforeFetchDispatch: options.beforeFetchDispatch,
+          }
+        : {}),
       ...(options?.onFetchDispatch ? { onFetchDispatch: options.onFetchDispatch } : {}),
     };
     let result: Awaited<ReturnType<typeof fetchWithSsrFGuard>>;

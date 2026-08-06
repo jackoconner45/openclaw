@@ -67,6 +67,11 @@ export type GuardedFetchOptions = {
   fetchImpl?: FetchLike;
   init?: RequestInit;
   /**
+   * Runs for every physical hop after SSRF/DNS preflight and immediately
+   * before the underlying fetch. Failure blocks dispatch.
+   */
+  beforeFetchDispatch?: (params: { url: string; init: RequestInit }) => void;
+  /**
    * Fires once immediately before the first fetch invocation, after request
    * preflight. Redirect hops remain one transport attempt.
    */
@@ -660,6 +665,7 @@ async function fetchWithSsrFGuardInternal(
       // because the default global fetch path will not honor per-request
       // dispatchers.
       const shouldUseRuntimeFetch = Boolean(dispatcher) && !supportsDispatcherInit;
+      params.beforeFetchDispatch?.({ url: parsedUrl.toString(), init });
       const responsePromise = shouldUseRuntimeFetch
         ? fetchWithRuntimeDispatcher(parsedUrl.toString(), init)
         : defaultFetch(parsedUrl.toString(), init);

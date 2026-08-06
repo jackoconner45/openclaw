@@ -93,6 +93,7 @@ describe("embedded run auth plan provider pin", () => {
       baseUrl: "https://api.openai.com/v1",
       runtime: "openclaw",
       authBindingId: "c".repeat(32),
+      contentDigestKey: "d".repeat(64),
       credentialState: "frozen_in_memory",
       credentialEnvName: "OPENAI_API_KEY",
       fallbacks: "disabled",
@@ -108,7 +109,23 @@ describe("embedded run auth plan provider pin", () => {
       thinking: "high",
       seed: "absent",
       authoredRequestParams: "absent",
-      allowedRequestControls: [],
+      maxLogicalCalls: 64,
+      expectedReasoning: { effort: "high", summary: "auto" },
+      expectedInclude: ["reasoning.encrypted_content"],
+      expectedMetadata: {
+        source: "openai_transport_turn_state",
+        keys: [
+          "openclaw_session_id",
+          "openclaw_transport",
+          "openclaw_turn_attempt",
+          "openclaw_turn_id",
+        ],
+        valueClass: "volatile_execution_metadata",
+      },
+      expectedToolChoice: "absent",
+      expectedPromptCacheKey: "session_boundary",
+      expectedPromptCacheRetention: "absent",
+      expectedMaxRetries: 2,
     } satisfies FrontierEvidencePolicy;
     vi.stubEnv("OPENAI_API_KEY", "sk-mutated-after-admission");
 

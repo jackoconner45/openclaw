@@ -1,7 +1,8 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import { createHash } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import fs from "node:fs/promises";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
+import type { FrontierEvidenceBinding } from "./frontier-evidence-transport-policy.js";
 
 export const FRONTIER_EVIDENCE_POLICY_VERSION = 1 as const;
 
@@ -16,6 +17,7 @@ export type FrontierEvidencePolicy = {
   baseUrl: "https://api.openai.com/v1";
   runtime: "openclaw";
   authBindingId: string;
+  contentDigestKey: string;
   credentialState: "frozen_in_memory";
   credentialEnvName: "OPENAI_API_KEY";
   fallbacks: "disabled";
@@ -31,22 +33,43 @@ export type FrontierEvidencePolicy = {
   thinking: "high";
   seed: "absent";
   authoredRequestParams: "absent";
-  allowedRequestControls: string[];
+  maxLogicalCalls: number;
+  expectedReasoning: { effort: "high"; summary: "auto" };
+  expectedInclude: ["reasoning.encrypted_content"];
+  expectedMetadata: {
+    source: "openai_transport_turn_state";
+    keys: [
+      "openclaw_session_id",
+      "openclaw_transport",
+      "openclaw_turn_attempt",
+      "openclaw_turn_id",
+    ];
+    valueClass: "volatile_execution_metadata";
+  };
+  expectedToolChoice: "absent";
+  expectedPromptCacheKey: "session_boundary";
+  expectedPromptCacheRetention: "absent";
+  expectedMaxRetries: 2;
 };
 
 type FrontierEvidenceScope = {
   policy: FrontierEvidencePolicy;
   expectedAuthProfileId: string;
+  bindings: FrontierEvidenceBinding[];
+  taskDigest?: string;
 };
 
 const frontierEvidencePolicy = new AsyncLocalStorage<FrontierEvidenceScope>();
-
 export function runWithFrontierEvidencePolicy<T>(
   policy: FrontierEvidencePolicy,
   expectedAuthProfileId: string,
   run: () => T,
+  taskDigest?: string,
 ): T {
-  return frontierEvidencePolicy.run({ policy, expectedAuthProfileId }, run);
+  return frontierEvidencePolicy.run(
+    { policy, expectedAuthProfileId, bindings: [], taskDigest },
+    run,
+  );
 }
 
 export function getFrontierEvidencePolicy(): FrontierEvidencePolicy | undefined {
@@ -57,11 +80,39 @@ export function getFrontierEvidenceExpectedAuthProfileId(): string | undefined {
   return frontierEvidencePolicy.getStore()?.expectedAuthProfileId;
 }
 
+export function registerFrontierEvidenceBinding(binding: FrontierEvidenceBinding): void {
+  const scope = frontierEvidencePolicy.getStore();
+  if (!scope) {
+    throw new Error("frontier evidence policy is not active");
+  }
+  scope.bindings.push(binding);
+}
+
+export function readFrontierEvidenceBindings(): readonly FrontierEvidenceBinding[] {
+  return frontierEvidencePolicy.getStore()?.bindings ?? [];
+}
+
+export function getFrontierEvidenceTaskDigest(): string | undefined {
+  return frontierEvidencePolicy.getStore()?.taskDigest;
+}
+
+export function computeFrontierEvidenceDigest(
+  key: string,
+  domain: "task" | "full-input" | "comparable-input" | "tool-schema",
+  value: string,
+): string {
+  return createHmac("sha256", Buffer.from(key, "hex"))
+    .update(`openclaw-frontier-${domain}-v1\0`)
+    .update(value, "utf8")
+    .digest("hex");
+}
+
 function isSha256(value: unknown): value is string {
   return typeof value === "string" && /^[a-f0-9]{64}$/u.test(value);
 }
 
 function parseFrontierEvidencePolicy(value: unknown): Omit<FrontierEvidencePolicy, "policySha256"> {
+  const maxLogicalCalls = isRecord(value) ? value.maxLogicalCalls : undefined;
   if (
     !isRecord(value) ||
     value.version !== FRONTIER_EVIDENCE_POLICY_VERSION ||
@@ -76,6 +127,8 @@ function parseFrontierEvidencePolicy(value: unknown): Omit<FrontierEvidencePolic
     value.runtime !== "openclaw" ||
     typeof value.authBindingId !== "string" ||
     !/^[a-f0-9]{32}$/u.test(value.authBindingId) ||
+    typeof value.contentDigestKey !== "string" ||
+    !/^[a-f0-9]{64}$/u.test(value.contentDigestKey) ||
     value.credentialState !== "frozen_in_memory" ||
     value.credentialEnvName !== "OPENAI_API_KEY" ||
     value.fallbacks !== "disabled" ||
@@ -90,8 +143,31 @@ function parseFrontierEvidencePolicy(value: unknown): Omit<FrontierEvidencePolic
     value.thinking !== "high" ||
     value.seed !== "absent" ||
     value.authoredRequestParams !== "absent" ||
-    !Array.isArray(value.allowedRequestControls) ||
-    value.allowedRequestControls.some((entry) => typeof entry !== "string")
+    typeof maxLogicalCalls !== "number" ||
+    !Number.isInteger(maxLogicalCalls) ||
+    maxLogicalCalls < 1 ||
+    maxLogicalCalls > 256 ||
+    !isRecord(value.expectedReasoning) ||
+    value.expectedReasoning.effort !== "high" ||
+    value.expectedReasoning.summary !== "auto" ||
+    Object.keys(value.expectedReasoning).length !== 2 ||
+    !Array.isArray(value.expectedInclude) ||
+    value.expectedInclude.length !== 1 ||
+    value.expectedInclude[0] !== "reasoning.encrypted_content" ||
+    !isRecord(value.expectedMetadata) ||
+    value.expectedMetadata.source !== "openai_transport_turn_state" ||
+    JSON.stringify(value.expectedMetadata.keys) !==
+      JSON.stringify([
+        "openclaw_session_id",
+        "openclaw_transport",
+        "openclaw_turn_attempt",
+        "openclaw_turn_id",
+      ]) ||
+    value.expectedMetadata.valueClass !== "volatile_execution_metadata" ||
+    value.expectedToolChoice !== "absent" ||
+    value.expectedPromptCacheKey !== "session_boundary" ||
+    value.expectedPromptCacheRetention !== "absent" ||
+    value.expectedMaxRetries !== 2
   ) {
     throw new Error("frontier evidence policy schema is invalid");
   }
@@ -105,6 +181,7 @@ function parseFrontierEvidencePolicy(value: unknown): Omit<FrontierEvidencePolic
     baseUrl: "https://api.openai.com/v1",
     runtime: "openclaw",
     authBindingId: value.authBindingId,
+    contentDigestKey: value.contentDigestKey,
     credentialState: "frozen_in_memory",
     credentialEnvName: "OPENAI_API_KEY",
     fallbacks: "disabled",
@@ -120,9 +197,23 @@ function parseFrontierEvidencePolicy(value: unknown): Omit<FrontierEvidencePolic
     thinking: "high",
     seed: "absent",
     authoredRequestParams: "absent",
-    allowedRequestControls: [...new Set(value.allowedRequestControls)].toSorted((left, right) =>
-      left.localeCompare(right),
-    ),
+    maxLogicalCalls,
+    expectedReasoning: { effort: "high", summary: "auto" },
+    expectedInclude: ["reasoning.encrypted_content"],
+    expectedMetadata: {
+      source: "openai_transport_turn_state",
+      keys: [
+        "openclaw_session_id",
+        "openclaw_transport",
+        "openclaw_turn_attempt",
+        "openclaw_turn_id",
+      ],
+      valueClass: "volatile_execution_metadata",
+    },
+    expectedToolChoice: "absent",
+    expectedPromptCacheKey: "session_boundary",
+    expectedPromptCacheRetention: "absent",
+    expectedMaxRetries: 2,
   };
 }
 
